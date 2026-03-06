@@ -22,3 +22,14 @@ export interface SessionFile {
 }
 
 export type LogLevel = "V" | "D" | "I" | "W" | "E" | "F";
+
+export type PanelFocus = "actions" | "sessions" | "log";
+
+export interface AppState {
+  deviceInfo: DeviceInfo | null;
+  deviceConnected: boolean;
+  sessions: SessionInfo[];
+  focusedPanel: PanelFocus;
+  overlayActive: boolean;
+  statusMessage: string | null;
+}

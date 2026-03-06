@@ -26,11 +26,14 @@ namespace RealityLog.Camera
         [SerializeField] private float recorderStartDelayAfterReopenSeconds = 0.25f;
         [SerializeField] private float maxWaitForCameraOpenSeconds = 1.5f;
 
+        private const string VIDEO_METADATA_FILE_NAME = "video_metadata.json";
+
         private AndroidJavaObject? currentInstance;
         private CameraMetadata? cameraMetadata;
         private bool isRecordingSessionActive;
         private bool waitingForCameraReopen;
         private Coroutine? delayedStartCoroutine;
+        private long recordingStartUnixMs;
 
         public override AndroidJavaObject? GetJavaInstance(CameraMetadata metadata)
         {
@@ -131,6 +134,7 @@ namespace RealityLog.Camera
             try
             {
                 currentInstance.Call(STOP_RECORDING_METHOD_NAME);
+                WriteVideoMetadata();
             }
             catch (Exception ex)
             {
@@ -176,6 +180,7 @@ namespace RealityLog.Camera
             try
             {
                 currentInstance.Call(START_RECORDING_METHOD_NAME);
+                recordingStartUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 isRecordingSessionActive = true;
             }
             catch (Exception ex)
@@ -189,6 +194,30 @@ namespace RealityLog.Camera
             var dataDirPath = Path.Join(Application.persistentDataPath, dataDirectoryName);
             Directory.CreateDirectory(dataDirPath);
             return Path.Join(dataDirPath, outputVideoFileName);
+        }
+
+        private void WriteVideoMetadata()
+        {
+            try
+            {
+                var stopUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var dataDirPath = Path.Join(Application.persistentDataPath, dataDirectoryName);
+                Directory.CreateDirectory(dataDirPath);
+                var metadataPath = Path.Join(dataDirPath, VIDEO_METADATA_FILE_NAME);
+
+                var json = $"{{\n" +
+                    $"  \"recording_start_unix_ms\": {recordingStartUnixMs},\n" +
+                    $"  \"recording_stop_unix_ms\": {stopUnixMs},\n" +
+                    $"  \"configured_fps\": {targetFrameRate},\n" +
+                    $"  \"video_file\": \"{outputVideoFileName}\"\n" +
+                    $"}}";
+                File.WriteAllText(metadataPath, json);
+                Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider wrote {metadataPath}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider - Failed to write video metadata: {ex.Message}");
+            }
         }
 
         private void WriteCameraMetadataFile()

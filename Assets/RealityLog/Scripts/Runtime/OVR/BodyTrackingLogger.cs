@@ -13,6 +13,17 @@ namespace RealityLog.OVR
     /// Logs full body tracking skeleton data to CSV during recording sessions.
     /// Uses OVRPlugin.GetBodyState4 with FullBody joint set (84 joints).
     /// Each row contains a timestamp and all joint positions/orientations.
+    ///
+    /// <para><b>Timing:</b> Polled every FixedUpdate (~50 Hz), but the OVR body tracking
+    /// runtime delivers new poses at ~30 Hz. Duplicate timestamps are filtered, so the
+    /// effective CSV output rate is ~30 Hz with slight jitter. Gaps of 580 ms or more
+    /// indicate tracking loss (e.g. hands out of view), not timing jitter.</para>
+    ///
+    /// <para><b>Root joint (index 0):</b> Floor-projected origin (Y ≈ 0). For actual
+    /// pelvis height, use Hips (index 1).</para>
+    ///
+    /// <para><b>Joint names:</b> Hardcoded from the XR_META_body_tracking_full_body spec
+    /// to avoid an assembly dependency on the Interaction SDK (BodyJointId enum).</para>
     /// </summary>
     public class BodyTrackingLogger : MonoBehaviour
     {
@@ -20,6 +31,98 @@ namespace RealityLog.OVR
         private const int FULL_BODY_JOINT_COUNT = 84;
         // 7 values per joint (pos xyz + rot xyzw)
         private const int VALUES_PER_JOINT = 7;
+
+        /// <summary>
+        /// Full-body joint names matching XR_META_body_tracking_full_body / BodyJointId enum.
+        /// Index 0 = Root (floor-projected, Y≈0; use Hips for pelvis height).
+        /// </summary>
+        private static readonly string[] JOINT_NAMES = new string[]
+        {
+            "Root",                          // 0
+            "Hips",                          // 1
+            "SpineLower",                    // 2
+            "SpineMiddle",                   // 3
+            "SpineUpper",                    // 4
+            "Chest",                         // 5
+            "Neck",                          // 6
+            "Head",                          // 7
+            "LeftShoulder",                  // 8
+            "LeftScapula",                   // 9
+            "LeftArmUpper",                  // 10
+            "LeftArmLower",                  // 11
+            "LeftHandWristTwist",            // 12
+            "RightShoulder",                 // 13
+            "RightScapula",                  // 14
+            "RightArmUpper",                 // 15
+            "RightArmLower",                 // 16
+            "RightHandWristTwist",           // 17
+            "LeftHandPalm",                  // 18
+            "LeftHandWrist",                 // 19
+            "LeftHandThumbMetacarpal",       // 20
+            "LeftHandThumbProximal",         // 21
+            "LeftHandThumbDistal",           // 22
+            "LeftHandThumbTip",              // 23
+            "LeftHandIndexMetacarpal",       // 24
+            "LeftHandIndexProximal",         // 25
+            "LeftHandIndexIntermediate",     // 26
+            "LeftHandIndexDistal",           // 27
+            "LeftHandIndexTip",              // 28
+            "LeftHandMiddleMetacarpal",      // 29
+            "LeftHandMiddleProximal",        // 30
+            "LeftHandMiddleIntermediate",    // 31
+            "LeftHandMiddleDistal",          // 32
+            "LeftHandMiddleTip",             // 33
+            "LeftHandRingMetacarpal",        // 34
+            "LeftHandRingProximal",          // 35
+            "LeftHandRingIntermediate",      // 36
+            "LeftHandRingDistal",            // 37
+            "LeftHandRingTip",               // 38
+            "LeftHandLittleMetacarpal",      // 39
+            "LeftHandLittleProximal",        // 40
+            "LeftHandLittleIntermediate",    // 41
+            "LeftHandLittleDistal",          // 42
+            "LeftHandLittleTip",             // 43
+            "RightHandPalm",                 // 44
+            "RightHandWrist",                // 45
+            "RightHandThumbMetacarpal",      // 46
+            "RightHandThumbProximal",        // 47
+            "RightHandThumbDistal",          // 48
+            "RightHandThumbTip",             // 49
+            "RightHandIndexMetacarpal",      // 50
+            "RightHandIndexProximal",        // 51
+            "RightHandIndexIntermediate",    // 52
+            "RightHandIndexDistal",          // 53
+            "RightHandIndexTip",             // 54
+            "RightHandMiddleMetacarpal",     // 55
+            "RightHandMiddleProximal",       // 56
+            "RightHandMiddleIntermediate",   // 57
+            "RightHandMiddleDistal",         // 58
+            "RightHandMiddleTip",            // 59
+            "RightHandRingMetacarpal",       // 60
+            "RightHandRingProximal",         // 61
+            "RightHandRingIntermediate",     // 62
+            "RightHandRingDistal",           // 63
+            "RightHandRingTip",              // 64
+            "RightHandLittleMetacarpal",     // 65
+            "RightHandLittleProximal",       // 66
+            "RightHandLittleIntermediate",   // 67
+            "RightHandLittleDistal",         // 68
+            "RightHandLittleTip",            // 69
+            "LeftUpperLeg",                  // 70
+            "LeftLowerLeg",                  // 71
+            "LeftFootAnkleTwist",            // 72
+            "LeftFootAnkle",                 // 73
+            "LeftFootSubtalar",              // 74
+            "LeftFootTransverse",            // 75
+            "LeftFootBall",                  // 76
+            "RightUpperLeg",                 // 77
+            "RightLowerLeg",                 // 78
+            "RightFootAnkleTwist",           // 79
+            "RightFootAnkle",                // 80
+            "RightFootSubtalar",             // 81
+            "RightFootTransverse",           // 82
+            "RightFootBall",                 // 83
+        };
 
         [SerializeField] private string fileName = "body_tracking.csv";
         [SerializeField] private string directoryName = "";
@@ -172,9 +275,9 @@ namespace RealityLog.OVR
 
         private static string GetJointName(int index)
         {
-            if (Enum.IsDefined(typeof(OVRPlugin.BoneId), index))
+            if (index >= 0 && index < JOINT_NAMES.Length)
             {
-                return ((OVRPlugin.BoneId)index).ToString();
+                return JOINT_NAMES[index];
             }
             return $"Joint_{index}";
         }

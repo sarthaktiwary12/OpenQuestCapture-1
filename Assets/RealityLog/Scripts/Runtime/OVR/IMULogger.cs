@@ -8,12 +8,18 @@ using RealityLog.IO;
 
 namespace RealityLog.OVR
 {
+    /// <summary>
+    /// Logs head/controller IMU data (acceleration, gyroscope, velocity) to CSV.
+    /// <para><b>Acceleration values:</b> The OVR runtime returns gravity-compensated
+    /// (linear) acceleration — gravity has already been subtracted. The CSV columns
+    /// are labelled <c>linear_acc_*</c> to reflect this.</para>
+    /// </summary>
     public class IMULogger : MonoBehaviour
     {
         private static readonly string[] HEADER = new string[]
             {
                 "unix_time", "ovr_timestamp",
-                "acc_x", "acc_y", "acc_z", 
+                "linear_acc_x", "linear_acc_y", "linear_acc_z",
                 "gyro_x", "gyro_y", "gyro_z",
                 "vel_x", "vel_y", "vel_z",
                 "ang_acc_x", "ang_acc_y", "ang_acc_z"

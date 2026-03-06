@@ -2,7 +2,6 @@
 
 using System;
 using System.IO;
-using System.IO.Compression;
 using UnityEngine;
 using RealityLog.Common;
 
@@ -208,16 +207,12 @@ namespace RealityLog.FileOperations
                     File.Delete(zipPath);
                 }
 
-                bool success = false;
-                string message = "";
-
-                Exception? threadException = null;
-
-                // Get file list on main thread
-                string[] files;
+                // Use ZipHelper for background compression
+                System.Threading.Tasks.Task compTask;
+                ZipHelper.CompressionProgress progressState;
                 try
                 {
-                    files = Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories);
+                    (compTask, progressState) = ZipHelper.CompressDirectoryAsync(sourcePath, zipPath);
                 }
                 catch (Exception e)
                 {
@@ -225,46 +220,12 @@ namespace RealityLog.FileOperations
                     yield break;
                 }
 
-                int totalFiles = files.Length;
-                // Shared state for progress reporting
-                // We use a class or closure to share state safely
-                var progressState = new ProgressState();
-
-                // Start background task
-                var task = System.Threading.Tasks.Task.Run(() =>
-                {
-                    try
-                    {
-                        // Create empty zip
-                        using (var zipToOpen = new FileStream(zipPath, FileMode.Create))
-                        using (var archive = new ZipArchive(zipToOpen, ZipArchiveMode.Create))
-                        {
-                            foreach (var file in files)
-                            {
-                                if (progressState.IsCancelled) break;
-
-                                string entryName = Path.GetRelativePath(sourcePath, file);
-                                // Use Fastest compression to speed up the process on Quest
-                                archive.CreateEntryFromFile(file, entryName, System.IO.Compression.CompressionLevel.Fastest);
-                                
-                                System.Threading.Interlocked.Increment(ref progressState.ProcessedFiles);
-                            }
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        progressState.Exception = e;
-                    }
-                    finally
-                    {
-                        progressState.IsDone = true;
-                    }
-                });
-
                 // Poll for progress on main thread
                 while (!progressState.IsDone)
                 {
-                    float progress = (float)progressState.ProcessedFiles / totalFiles;
+                    float progress = progressState.TotalFiles > 0
+                        ? (float)progressState.ProcessedFiles / progressState.TotalFiles
+                        : 0f;
                     OnOperationProgress?.Invoke(operationName, progress);
                     yield return null;
                 }
@@ -300,10 +261,10 @@ namespace RealityLog.FileOperations
 
                         // Move zip to downloads
                         File.Move(zipPath, destZipPath);
-                        
+
                         // Trigger media scan so file appears in Quest Files app immediately
                         ScanFile(destZipPath);
-                        
+
                         Debug.Log($"[{Constants.LOG_TAG}] RecordingOperations: Exported {directoryName} to {destZipPath}");
                         OnOperationComplete?.Invoke("Export", true, $"Exported to Downloads: {Path.GetFileName(destZipPath)}");
                     }
@@ -324,14 +285,6 @@ namespace RealityLog.FileOperations
                 // Restore original runInBackground setting
                 Application.runInBackground = originalRunInBackground;
             }
-        }
-
-        private class ProgressState
-        {
-            public int ProcessedFiles;
-            public bool IsDone;
-            public bool IsCancelled;
-            public Exception? Exception;
         }
 
         // Keeping synchronous methods for compatibility if needed, or we can remove them.

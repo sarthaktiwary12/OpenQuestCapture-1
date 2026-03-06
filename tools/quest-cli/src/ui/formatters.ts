@@ -67,10 +67,3 @@ export function logLevelColor(level: string): (s: string) => string {
   }
 }
 
-export function tableRow(columns: string[], widths: number[]): string {
-  return columns.map((col, i) => padRight(col, widths[i])).join("  ");
-}
-
-export function divider(char = "─", width = 60): string {
-  return pc.dim(char.repeat(width));
-}

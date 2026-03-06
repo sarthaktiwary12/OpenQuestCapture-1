@@ -223,6 +223,7 @@ MonoBehaviour:
   rightDepthMapDirectoryName: right_depth
   leftDepthDescFileName: left_depth_descriptors.csv
   rightDepthDescFileName: right_depth_descriptors.csv
+  enableDepthCapture: 1
   captureTimer: {fileID: 1964602098}
 --- !u!1 &162001329
 GameObject:
@@ -7564,7 +7565,7 @@ MonoBehaviour:
   - {fileID: 1104910062}
   captureTimer: {fileID: 1964602098}
   generateTimestampedDirectories: 1
-  recordDepthMaps: 0
+  recordDepthMaps: 1
   onRecordingSaved:
     m_PersistentCalls:
       m_Calls:

@@ -103,7 +103,9 @@ namespace RealityLog.Depth
 
             if (!enableDepthCapture)
             {
-                Debug.Log($"[{Constants.LOG_TAG}] DepthMapExporter - Depth capture disabled; saving camera raw frames only.");
+                Debug.LogWarning($"[{Constants.LOG_TAG}] DepthMapExporter - Depth capture is DISABLED. " +
+                    "Enable 'enableDepthCapture' on the DepthMapExporter component and 'recordDepthMaps' " +
+                    "on RecordingManager to capture depth data.");
                 return;
             }
 
