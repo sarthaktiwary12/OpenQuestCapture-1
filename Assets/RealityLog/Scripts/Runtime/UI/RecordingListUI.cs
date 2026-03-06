@@ -87,6 +87,13 @@ namespace RealityLog.UI
         {
             Debug.Log($"[{Constants.LOG_TAG}] RecordingListUI: OnRecordingsUpdated called with {recordings.Count} recordings");
 
+            // Collapse expanded items before destroying to clean up detail panels
+            foreach (var item in itemInstances)
+            {
+                if (item != null)
+                    item.CollapseIfExpanded();
+            }
+
             // Clear existing items
             foreach (var item in itemInstances)
             {
@@ -127,6 +134,7 @@ namespace RealityLog.UI
                     itemUI.SetRecording(recording);
                     itemUI.OnDeleteClicked += HandleDelete;
                     itemUI.OnExportClicked += HandleExport;
+                    itemUI.OnToggleExpand += HandleAccordion;
                     itemInstances.Add(itemUI);
                     createdCount++;
                 }
@@ -137,6 +145,16 @@ namespace RealityLog.UI
             }
 
             Debug.Log($"[{Constants.LOG_TAG}] RecordingListUI: Created {createdCount} list items");
+        }
+
+        private void HandleAccordion(RecordingListItemUI expandedItem)
+        {
+            // Accordion: collapse all other items when one expands
+            foreach (var item in itemInstances)
+            {
+                if (item != null && item != expandedItem)
+                    item.CollapseIfExpanded();
+            }
         }
 
         private void HandleDelete(string directoryName)

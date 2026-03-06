@@ -30,8 +30,22 @@ namespace RealityLog.UI
             public string FullPath { get; set; } = string.Empty;
             public DateTime CreationTime { get; set; }
             public long SizeBytes { get; set; }
+            public HealthLevel QuickHealth { get; set; } = HealthLevel.Good;
+            public double DurationSeconds { get; set; } = -1;
             public string FormattedSize => FormatBytes(SizeBytes);
             public string FormattedDate => CreationTime.ToString("yyyy-MM-dd HH:mm:ss");
+
+            public string FormattedDuration
+            {
+                get
+                {
+                    if (DurationSeconds < 0) return "--:--";
+                    int totalSec = (int)DurationSeconds;
+                    int min = totalSec / 60;
+                    int sec = totalSec % 60;
+                    return $"{min:D2}:{sec:D2}";
+                }
+            }
 
             private static string FormatBytes(long bytes)
             {
@@ -92,9 +106,11 @@ namespace RealityLog.UI
                                 DirectoryName = dirName,
                                 FullPath = dirPath,
                                 CreationTime = info.CreationTime,
-                                SizeBytes = CalculateDirectorySize(dirPath)
+                                SizeBytes = CalculateDirectorySize(dirPath),
+                                QuickHealth = QuickHealthCheck(dirPath),
+                                DurationSeconds = QuickParseDuration(dirPath)
                             };
-                            
+
                             recordings.Add(recordingInfo);
                         }
                         catch (Exception e)
@@ -144,6 +160,79 @@ namespace RealityLog.UI
                 // Return 0 if we can't calculate size
             }
             return size;
+        }
+
+        [Serializable]
+        private class VideoMetadataQuick
+        {
+            public long recording_start_unix_ms;
+            public long recording_stop_unix_ms;
+        }
+
+        private static HealthLevel QuickHealthCheck(string dirPath)
+        {
+            // Check video exists and has reasonable size
+            string videoPath = Path.Combine(dirPath, "center_camera.mp4");
+            bool videoOk = File.Exists(videoPath);
+            long videoSize = 0;
+            if (videoOk)
+            {
+                try { videoSize = new FileInfo(videoPath).Length; } catch { }
+            }
+
+            if (!videoOk || videoSize < 1024)
+                return HealthLevel.Error;
+
+            // Check for any motion data
+            bool hasMotion = false;
+            string[] motionFiles = { "hmd_poses.csv", "imu.csv", "left_controller_poses.csv", "right_controller_poses.csv" };
+            foreach (var f in motionFiles)
+            {
+                string p = Path.Combine(dirPath, f);
+                if (File.Exists(p))
+                {
+                    try
+                    {
+                        if (new FileInfo(p).Length > 0)
+                        {
+                            hasMotion = true;
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (!hasMotion)
+                return HealthLevel.Error;
+
+            if (videoSize < 51200)
+                return HealthLevel.Warning;
+
+            return HealthLevel.Good;
+        }
+
+        private static double QuickParseDuration(string dirPath)
+        {
+            string metadataPath = Path.Combine(dirPath, "video_metadata.json");
+            if (!File.Exists(metadataPath))
+                return -1;
+
+            try
+            {
+                string json = File.ReadAllText(metadataPath);
+                var metadata = JsonUtility.FromJson<VideoMetadataQuick>(json);
+                if (metadata != null && metadata.recording_stop_unix_ms > metadata.recording_start_unix_ms)
+                {
+                    return (metadata.recording_stop_unix_ms - metadata.recording_start_unix_ms) / 1000.0;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] RecordingListManager: Failed to parse duration from {metadataPath}: {e.Message}");
+            }
+
+            return -1;
         }
 
         private void Start()
