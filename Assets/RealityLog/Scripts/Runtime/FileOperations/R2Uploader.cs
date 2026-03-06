@@ -4,6 +4,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.Networking;
@@ -13,7 +14,8 @@ namespace RealityLog.FileOperations
 {
     /// <summary>
     /// Uploads recording directories to Cloudflare R2 via presigned URLs.
-    /// Compresses to ZIP, fetches a presigned PUT URL from a Worker, then streams the upload.
+    /// Offline-first: persists upload state per recording, syncs a manifest of all
+    /// pending recordings to the server before uploading, and waits for WiFi gracefully.
     /// Wire RecordingManager.onRecordingSaved → OnRecordingSaved in the Inspector.
     /// </summary>
     public class R2Uploader : MonoBehaviour
@@ -32,7 +34,7 @@ namespace RealityLog.FileOperations
         [Tooltip("Delete the ZIP file after successful upload")]
         [SerializeField] private bool deleteZipAfterUpload = true;
 
-        [Tooltip("Maximum number of retry attempts per upload")]
+        [Tooltip("Maximum number of retry attempts per upload (network errors only, not offline waits)")]
         [SerializeField] private int maxRetries = 3;
 
         [Tooltip("Initial delay in seconds before first retry (doubles each attempt)")]
@@ -41,12 +43,16 @@ namespace RealityLog.FileOperations
         [Tooltip("Re-queue failed/interrupted uploads on startup")]
         [SerializeField] private bool retryFailedOnStartup = true;
 
+        [Tooltip("How often to check for WiFi when offline (seconds)")]
+        [SerializeField] private float wifiPollIntervalSec = 15f;
+
         [Header("Events")]
         public UnityEvent<string, float> OnUploadProgress = default!;
         public UnityEvent<string, bool, string> OnUploadComplete = default!;
 
         private readonly Queue<string> uploadQueue = new();
         private bool isProcessing;
+        private string deviceId = "";
 
         [Serializable]
         private class PresignResponse
@@ -56,10 +62,64 @@ namespace RealityLog.FileOperations
             public string error = "";
         }
 
+        [Serializable]
+        private class ManifestEntry
+        {
+            public string directoryName = "";
+            public string status = "";
+            public long sizeBytes;
+            public int fileCount;
+            public string errorMessage = "";
+        }
+
+        [Serializable]
+        private class DeviceManifest
+        {
+            public string deviceId = "";
+            public string deviceModel = "";
+            public string timestamp = "";
+            public List<ManifestEntry> recordings = new();
+        }
+
         private void Start()
         {
+            deviceId = SystemInfo.deviceUniqueIdentifier;
+            Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: Device ID = {deviceId}");
+
             if (retryFailedOnStartup)
-                StartCoroutine(RetryInterruptedUploads());
+                StartCoroutine(StartupSequence());
+        }
+
+        private IEnumerator StartupSequence()
+        {
+            // Wait a frame for everything else to initialize
+            yield return null;
+
+            // Scan for interrupted uploads and re-queue them
+            string basePath = Application.persistentDataPath;
+            if (!Directory.Exists(basePath)) yield break;
+
+            int requeued = 0;
+            foreach (var dir in Directory.GetDirectories(basePath))
+            {
+                var status = UploadStatus.Read(dir);
+                if (status == null) continue;
+
+                if (status.status is "compressing" or "uploading" or "pending" or "failed")
+                {
+                    string dirName = Path.GetFileName(dir);
+                    Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: Re-queuing '{dirName}' (was: {status.status})");
+                    uploadQueue.Enqueue(dirName);
+                    requeued++;
+                }
+            }
+
+            if (requeued > 0)
+            {
+                Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: {requeued} recording(s) queued for upload");
+                if (!isProcessing)
+                    StartCoroutine(ProcessQueue());
+            }
         }
 
         /// <summary>
@@ -67,6 +127,19 @@ namespace RealityLog.FileOperations
         /// </summary>
         public void OnRecordingSaved(string directoryName)
         {
+            // Always write a pending status so the recording is tracked locally
+            // even if we can't upload right now
+            string fullPath = Path.Combine(Application.persistentDataPath, directoryName);
+            if (Directory.Exists(fullPath))
+            {
+                var existing = UploadStatus.Read(fullPath);
+                if (existing == null)
+                {
+                    var fresh = new UploadStatus { status = "pending" };
+                    UploadStatus.Write(fullPath, fresh);
+                }
+            }
+
             if (!autoUploadOnSave) return;
             Enqueue(directoryName);
         }
@@ -97,14 +170,97 @@ namespace RealityLog.FileOperations
             bool originalRunInBackground = Application.runInBackground;
             Application.runInBackground = true;
 
+            // Sync manifest before starting uploads — tells the server what this device has
+            yield return StartCoroutine(SyncManifest());
+
             while (uploadQueue.Count > 0)
             {
+                // Wait for WiFi before attempting each upload
+                yield return StartCoroutine(WaitForConnectivity());
+
                 string dirName = uploadQueue.Dequeue();
                 yield return StartCoroutine(UploadRecording(dirName));
             }
 
+            // Final manifest sync to update server with completed states
+            yield return StartCoroutine(SyncManifest());
+
             Application.runInBackground = originalRunInBackground;
             isProcessing = false;
+        }
+
+        /// <summary>
+        /// Polls until the device has network connectivity. Does not consume retry budget.
+        /// </summary>
+        private IEnumerator WaitForConnectivity()
+        {
+            while (Application.internetReachability == NetworkReachability.NotReachable)
+            {
+                Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: No network, checking again in {wifiPollIntervalSec}s...");
+                yield return new WaitForSeconds(wifiPollIntervalSec);
+            }
+        }
+
+        /// <summary>
+        /// Collects status of all recordings on device and POSTs a manifest to the server.
+        /// This lets the server know what data is stuck on this device.
+        /// </summary>
+        private IEnumerator SyncManifest()
+        {
+            if (string.IsNullOrEmpty(presignEndpoint)) yield break;
+            if (Application.internetReachability == NetworkReachability.NotReachable) yield break;
+
+            var manifest = new DeviceManifest
+            {
+                deviceId = deviceId,
+                deviceModel = SystemInfo.deviceModel,
+                timestamp = DateTime.UtcNow.ToString("o")
+            };
+
+            string basePath = Application.persistentDataPath;
+            foreach (var dir in Directory.GetDirectories(basePath))
+            {
+                var status = UploadStatus.Read(dir);
+                if (status == null) continue;
+
+                // Skip already-uploaded recordings from the manifest
+                if (status.status == "uploaded") continue;
+
+                int fileCount = 0;
+                try { fileCount = Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length; }
+                catch { /* ignore */ }
+
+                manifest.recordings.Add(new ManifestEntry
+                {
+                    directoryName = Path.GetFileName(dir),
+                    status = status.status,
+                    sizeBytes = status.sizeBytes,
+                    fileCount = fileCount,
+                    errorMessage = status.errorMessage
+                });
+            }
+
+            string json = JsonUtility.ToJson(manifest);
+            string manifestUrl = presignEndpoint.TrimEnd('/') + "/manifest";
+
+            using var req = new UnityWebRequest(manifestUrl, UnityWebRequest.kHttpVerbPOST);
+            req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json));
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.SetRequestHeader("Content-Type", "application/json");
+            if (!string.IsNullOrEmpty(authToken))
+                req.SetRequestHeader("Authorization", $"Bearer {authToken}");
+
+            yield return req.SendWebRequest();
+
+            if (req.result == UnityWebRequest.Result.Success)
+            {
+                Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: Manifest synced ({manifest.recordings.Count} pending recordings)");
+            }
+            else
+            {
+                // Non-fatal — upload can proceed without manifest sync
+                Debug.LogWarning($"[{Constants.LOG_TAG}] R2Uploader: Manifest sync failed: {req.error}");
+            }
         }
 
         private IEnumerator UploadRecording(string directoryName)
@@ -113,12 +269,17 @@ namespace RealityLog.FileOperations
             string zipPath = Path.Combine(Application.persistentDataPath, $"{directoryName}.zip");
             string zipFileName = $"{directoryName}.zip";
 
+            if (!Directory.Exists(sourcePath))
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] R2Uploader: Directory gone: {directoryName}");
+                yield break;
+            }
+
             // --- Phase 1: Compress (progress 0 → 0.5) ---
             var status = UploadStatus.Read(sourcePath) ?? new UploadStatus();
 
             // Skip compression if ZIP already exists (crash recovery)
-            bool needsCompression = !File.Exists(zipPath);
-            if (needsCompression)
+            if (!File.Exists(zipPath))
             {
                 status.status = "compressing";
                 UploadStatus.Write(sourcePath, status);
@@ -172,13 +333,8 @@ namespace RealityLog.FileOperations
                     yield return new WaitForSeconds(delay);
                 }
 
-                if (Application.internetReachability == NetworkReachability.NotReachable)
-                {
-                    Debug.LogWarning($"[{Constants.LOG_TAG}] R2Uploader: No internet, waiting...");
-                    yield return new WaitForSeconds(initialRetryDelaySec);
-                    attempt++;
-                    continue;
-                }
+                // Wait for connectivity — doesn't consume retry budget
+                yield return StartCoroutine(WaitForConnectivity());
 
                 // Fetch presigned URL
                 string presignUrl = $"{presignEndpoint}?filename={UnityWebRequest.EscapeURL(zipFileName)}";
@@ -218,7 +374,7 @@ namespace RealityLog.FileOperations
                 status.r2Key = presignResp.key;
                 UploadStatus.Write(sourcePath, status);
 
-                // Upload via PUT with UploadHandlerFile (streams from disk)
+                // Upload via PUT with UploadHandlerFile (streams from disk, no RAM copy)
                 using var uploadReq = new UnityWebRequest(presignResp.upload_url, UnityWebRequest.kHttpVerbPUT);
                 uploadReq.uploadHandler = new UploadHandlerFile(zipPath);
                 uploadReq.SetRequestHeader("Content-Type", "application/zip");
@@ -265,33 +421,12 @@ namespace RealityLog.FileOperations
         private void FailUpload(string sourcePath, string directoryName, UploadStatus status, string message)
         {
             status.status = "failed";
+            status.retryCount++;
             status.errorMessage = message;
             UploadStatus.Write(sourcePath, status);
 
             OnUploadComplete?.Invoke(directoryName, false, message);
             Debug.LogError($"[{Constants.LOG_TAG}] R2Uploader: {message} for '{directoryName}'");
-        }
-
-        private IEnumerator RetryInterruptedUploads()
-        {
-            // Wait a frame for everything else to initialize
-            yield return null;
-
-            string basePath = Application.persistentDataPath;
-            if (!Directory.Exists(basePath)) yield break;
-
-            foreach (var dir in Directory.GetDirectories(basePath))
-            {
-                var status = UploadStatus.Read(dir);
-                if (status == null) continue;
-
-                if (status.status == "compressing" || status.status == "uploading" || status.status == "failed")
-                {
-                    string dirName = Path.GetFileName(dir);
-                    Debug.Log($"[{Constants.LOG_TAG}] R2Uploader: Re-queuing interrupted upload: '{dirName}' (was: {status.status})");
-                    Enqueue(dirName);
-                }
-            }
         }
     }
 }
