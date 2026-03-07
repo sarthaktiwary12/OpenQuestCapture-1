@@ -99,7 +99,8 @@ namespace RealityLog.UI
         {
             "left_camera_characteristics.json",
             "right_camera_characteristics.json",
-            "left_camera_image_format.json"
+            "left_camera_image_format.json",
+            "episode_markers.json"
         };
 
         // Known optional directories

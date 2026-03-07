@@ -20,8 +20,10 @@ namespace RealityLog.Camera
         [SerializeField] private string outputVideoFileName = "center_camera.mp4";
         [SerializeField] private string cameraMetaDataFileName = "center_camera_characteristics.json";
         [SerializeField] private int targetFrameRate = 30;
-        [SerializeField] private int targetBitrateMbps = 8;
+        [SerializeField] private int targetBitrateMbps = 4;
         [SerializeField] private int iFrameIntervalSeconds = 1;
+        [SerializeField] private int maxResolutionHeight = 720;
+        [SerializeField] private bool useHevc = true;
         [SerializeField] private CameraSessionManager? cameraSessionManager = default!;
         [SerializeField] private float recorderStartDelayAfterReopenSeconds = 0.25f;
         [SerializeField] private float maxWaitForCameraOpenSeconds = 1.5f;
@@ -54,10 +56,13 @@ namespace RealityLog.Camera
                     outputFilePath,
                     targetFrameRate,
                     targetBitrateMbps,
-                    iFrameIntervalSeconds
+                    iFrameIntervalSeconds,
+                    maxResolutionHeight,
+                    useHevc ? 1 : 0
                 );
 
-                Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider initialized ({size.width}x{size.height}, {targetFrameRate}fps, {targetBitrateMbps}Mbps).");
+                var codec = useHevc ? "HEVC" : "H264";
+                Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider initialized ({size.width}x{size.height}, max {maxResolutionHeight}p, {targetFrameRate}fps, {targetBitrateMbps}Mbps, {codec}).");
             }
             catch (Exception ex)
             {
