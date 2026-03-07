@@ -34,8 +34,36 @@ namespace RealityLog.UI
             public HealthLevel QuickHealth { get; set; } = HealthLevel.Good;
             public string UploadStatusText { get; set; } = "";
             public double DurationSeconds { get; set; } = -1;
+            public int EpisodeMarkerCount { get; set; } = 0;
             public string FormattedSize => FormatBytes(SizeBytes);
             public string FormattedDate => CreationTime.ToString("yyyy-MM-dd HH:mm:ss");
+
+            public string FriendlyTitle
+            {
+                get
+                {
+                    if (DirectoryName.Length >= 15 &&
+                        int.TryParse(DirectoryName.Substring(0, 4), out int year) &&
+                        int.TryParse(DirectoryName.Substring(4, 2), out int month) &&
+                        int.TryParse(DirectoryName.Substring(6, 2), out int day) &&
+                        int.TryParse(DirectoryName.Substring(9, 2), out int hour) &&
+                        int.TryParse(DirectoryName.Substring(11, 2), out int minute))
+                    {
+                        var dt = new DateTime(year, month, day, hour, minute, 0);
+                        var today = DateTime.Today;
+
+                        if (dt.Date == today)
+                            return $"Today {dt:h:mm tt}";
+                        if (dt.Date == today.AddDays(-1))
+                            return $"Yesterday {dt:h:mm tt}";
+                        if (dt.Year == today.Year)
+                            return dt.ToString("MMM d, h:mm tt");
+                        return dt.ToString("MMM d yyyy, h:mm tt");
+                    }
+
+                    return DirectoryName;
+                }
+            }
 
             public string FormattedDuration
             {
@@ -112,7 +140,8 @@ namespace RealityLog.UI
                                 SizeBytes = CalculateDirectorySize(dirPath),
                                 QuickHealth = QuickHealthCheck(dirPath, uploadStatus),
                                 UploadStatusText = uploadStatus?.status ?? "",
-                                DurationSeconds = QuickParseDuration(dirPath)
+                                DurationSeconds = QuickParseDuration(dirPath),
+                                EpisodeMarkerCount = QuickParseEpisodeMarkerCount(dirPath)
                             };
 
                             recordings.Add(recordingInfo);
@@ -242,6 +271,30 @@ namespace RealityLog.UI
             }
 
             return -1;
+        }
+
+        [Serializable]
+        private class EpisodeMarkersQuick
+        {
+            public int marker_count;
+        }
+
+        private static int QuickParseEpisodeMarkerCount(string dirPath)
+        {
+            string markersPath = Path.Combine(dirPath, "episode_markers.json");
+            if (!File.Exists(markersPath))
+                return 0;
+
+            try
+            {
+                string json = File.ReadAllText(markersPath);
+                var data = JsonUtility.FromJson<EpisodeMarkersQuick>(json);
+                return data?.marker_count ?? 0;
+            }
+            catch
+            {
+                return 0;
+            }
         }
 
         private void Start()

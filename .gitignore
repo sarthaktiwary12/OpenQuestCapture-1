@@ -85,3 +85,8 @@ crashlytics-build.properties
 # Node/Bun
 node_modules/
 bun.lock*
+
+# Runtime data
+/data/
+/EPISODE_FORMAT.md
+Assets/Plugins/Android/app-release.aar.meta

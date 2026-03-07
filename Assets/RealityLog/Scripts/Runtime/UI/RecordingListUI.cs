@@ -2,6 +2,7 @@
 
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.UI;
 using TMPro;
 using RealityLog.Common;
 using RealityLog.FileOperations;
@@ -38,6 +39,9 @@ namespace RealityLog.UI
 
         private List<RecordingListItemUI> itemInstances = new List<RecordingListItemUI>();
         private Coroutine? statusHideCoroutine;
+        private GameObject? deleteAllButtonObj;
+        private bool deleteAllConfirmPending;
+        private Coroutine? deleteAllResetCoroutine;
 
         private void OnEnable()
         {
@@ -117,6 +121,14 @@ namespace RealityLog.UI
             }
             itemInstances.Clear();
 
+            // Destroy old Delete All button
+            if (deleteAllButtonObj != null)
+            {
+                Destroy(deleteAllButtonObj);
+                deleteAllButtonObj = null;
+            }
+            deleteAllConfirmPending = false;
+
             // Show/hide empty message
             if (emptyListMessage != null)
             {
@@ -160,6 +172,101 @@ namespace RealityLog.UI
             }
 
             Debug.Log($"[{Constants.LOG_TAG}] RecordingListUI: Created {createdCount} list items");
+
+            // Delete All button disabled for now
+            // if (recordings.Count > 0 && listContainer != null)
+            // {
+            //     CreateDeleteAllButton(recordings.Count);
+            // }
+        }
+
+        private void CreateDeleteAllButton(int count)
+        {
+            deleteAllButtonObj = new GameObject("DeleteAllButton", typeof(RectTransform));
+            deleteAllButtonObj.transform.SetParent(listContainer, false);
+            deleteAllButtonObj.transform.SetAsFirstSibling();
+
+            var rt = deleteAllButtonObj.GetComponent<RectTransform>();
+            rt.sizeDelta = new Vector2(0, 40);
+
+            var layout = deleteAllButtonObj.AddComponent<LayoutElement>();
+            layout.preferredHeight = 40;
+            layout.flexibleWidth = 1;
+
+            var bgImage = deleteAllButtonObj.AddComponent<Image>();
+            bgImage.color = new Color(0.6f, 0.15f, 0.15f, 0.8f);
+
+            var btn = deleteAllButtonObj.AddComponent<Button>();
+            var colors = btn.colors;
+            colors.highlightedColor = new Color(0.8f, 0.2f, 0.2f, 1f);
+            colors.pressedColor = new Color(0.5f, 0.1f, 0.1f, 1f);
+            btn.colors = colors;
+
+            var textObj = new GameObject("Text", typeof(RectTransform));
+            textObj.transform.SetParent(deleteAllButtonObj.transform, false);
+
+            var textRt = textObj.GetComponent<RectTransform>();
+            textRt.anchorMin = Vector2.zero;
+            textRt.anchorMax = Vector2.one;
+            textRt.sizeDelta = Vector2.zero;
+
+            var text = textObj.AddComponent<TextMeshProUGUI>();
+            text.text = $"Delete All ({count})";
+            text.fontSize = 16;
+            text.alignment = TextAlignmentOptions.Center;
+            text.color = Color.white;
+
+            btn.onClick.AddListener(() => HandleDeleteAllClick(text));
+        }
+
+        private void HandleDeleteAllClick(TextMeshProUGUI buttonText)
+        {
+            if (!deleteAllConfirmPending)
+            {
+                deleteAllConfirmPending = true;
+                buttonText.text = "Tap again to confirm";
+                buttonText.color = Color.yellow;
+
+                if (deleteAllResetCoroutine != null)
+                    StopCoroutine(deleteAllResetCoroutine);
+                deleteAllResetCoroutine = StartCoroutine(ResetDeleteAllConfirm(buttonText));
+                return;
+            }
+
+            deleteAllConfirmPending = false;
+            if (deleteAllResetCoroutine != null)
+            {
+                StopCoroutine(deleteAllResetCoroutine);
+                deleteAllResetCoroutine = null;
+            }
+
+            // Delete all recordings
+            var dirs = new List<string>();
+            foreach (var item in itemInstances)
+            {
+                if (item != null)
+                    dirs.Add(item.GetDirectoryName());
+            }
+
+            foreach (var dir in dirs)
+            {
+                if (operations != null)
+                    operations.DeleteRecording(dir);
+            }
+
+            RefreshList();
+        }
+
+        private System.Collections.IEnumerator ResetDeleteAllConfirm(TextMeshProUGUI buttonText)
+        {
+            yield return new WaitForSeconds(3f);
+            deleteAllConfirmPending = false;
+            if (buttonText != null)
+            {
+                buttonText.text = $"Delete All ({itemInstances.Count})";
+                buttonText.color = Color.white;
+            }
+            deleteAllResetCoroutine = null;
         }
 
         private void HandleAccordion(RecordingListItemUI expandedItem)

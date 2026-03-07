@@ -70,10 +70,15 @@ namespace RealityLog.UI
             recordingDirectoryName = info.DirectoryName;
 
             if (directoryNameText != null)
-                directoryNameText.text = info.DirectoryName;
+                directoryNameText.text = info.FriendlyTitle;
 
             if (dateText != null)
-                dateText.text = info.FormattedDate;
+            {
+                string episodeText = info.EpisodeMarkerCount > 0
+                    ? $" | {info.EpisodeMarkerCount} ep{(info.EpisodeMarkerCount != 1 ? "s" : "")}"
+                    : "";
+                dateText.text = $"{info.FormattedDuration}{episodeText}";
+            }
 
             if (sizeText != null)
             {
@@ -86,7 +91,7 @@ namespace RealityLog.UI
                     "failed" => " | Upload failed",
                     _ => ""
                 };
-                sizeText.text = $"{info.FormattedSize} | {info.FormattedDuration}{statusSuffix}";
+                sizeText.text = $"{info.FormattedSize}{statusSuffix}";
             }
 
             // Create health dot next to the directory name
