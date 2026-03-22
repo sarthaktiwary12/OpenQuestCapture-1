@@ -25,6 +25,10 @@ namespace RealityLog.Camera
         [SerializeField] private int iFrameIntervalSeconds = 1;
         [SerializeField] private int maxResolutionHeight = 720;
         [SerializeField] private bool useHevc = true;
+        [Header("Audio")]
+        [SerializeField] private bool enableAudio = true;
+        [SerializeField] private int audioBitrate = 128000;
+        [SerializeField] private int audioSamplingRate = 44100;
         [SerializeField] private CameraSessionManager? cameraSessionManager = default!;
         [SerializeField] private float recorderStartDelayAfterReopenSeconds = 0.25f;
         [SerializeField] private float maxWaitForCameraOpenSeconds = 1.5f;
@@ -64,10 +68,13 @@ namespace RealityLog.Camera
                     outputFilePath,
                     targetFrameRate,
                     targetBitrateMbps,
-                    iFrameIntervalSeconds
+                    iFrameIntervalSeconds,
+                    enableAudio,
+                    audioBitrate,
+                    audioSamplingRate
                 );
 
-                Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider initialized ({size.width}x{size.height}, {targetFrameRate}fps, {targetBitrateMbps}Mbps).");
+                Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider initialized ({size.width}x{size.height}, {targetFrameRate}fps, {targetBitrateMbps}Mbps, audio={enableAudio}).");
             }
             catch (Exception ex)
             {
@@ -314,7 +321,10 @@ namespace RealityLog.Camera
                     $"  \"recording_start_unix_ms\": {VideoStartUnixTimeMs},\n" +
                     $"  \"recording_stop_unix_ms\": {stopUnixMs},\n" +
                     $"  \"configured_fps\": {targetFrameRate},\n" +
-                    $"  \"video_file\": \"{outputVideoFileName}\"\n" +
+                    $"  \"video_file\": \"{outputVideoFileName}\",\n" +
+                    $"  \"audio_enabled\": {(enableAudio ? "true" : "false")},\n" +
+                    $"  \"audio_bitrate\": {audioBitrate},\n" +
+                    $"  \"audio_sampling_rate\": {audioSamplingRate}\n" +
                     $"}}";
                 File.WriteAllText(metadataPath, json);
                 Debug.Log($"[{Constants.LOG_TAG}] VideoRecorderSurfaceProvider wrote {metadataPath}");
