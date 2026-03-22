@@ -5,11 +5,12 @@ using System.Collections;
 using UnityEngine;
 using RealityLog.Common;
 
-namespace RealityLog
+namespace RealityLog.Network
 {
     /// <summary>
     /// Bootstraps the CloudRelayService after the HTTP server is up.
     /// Creates a persistent GameObject with the service attached.
+    /// Lives in RealityLog.Network assembly alongside CloudRelayService.
     /// </summary>
     public class CloudRelayBootstrap : MonoBehaviour
     {
@@ -28,21 +29,14 @@ namespace RealityLog
 
             try
             {
-                var controllerType = Type.GetType("RealityLog.Network.CloudRelayService, RealityLog.Network");
-                if (controllerType == null)
-                {
-                    Debug.LogError($"[{Constants.LOG_TAG}] CloudRelayBootstrap: Could not find CloudRelayService type");
-                    yield break;
-                }
-
-                if (FindFirstObjectByType(controllerType) != null)
+                if (FindFirstObjectByType<CloudRelayService>() != null)
                 {
                     Debug.Log($"[{Constants.LOG_TAG}] CloudRelayBootstrap: CloudRelayService already exists");
                     yield break;
                 }
 
                 var relayGo = new GameObject("CloudRelayService");
-                relayGo.AddComponent(controllerType);
+                relayGo.AddComponent<CloudRelayService>();
                 DontDestroyOnLoad(relayGo);
                 Debug.Log($"[{Constants.LOG_TAG}] CloudRelayBootstrap: Created CloudRelayService");
             }
