@@ -17,6 +17,7 @@ namespace RealityLog.Network
     /// MonoBehaviour that starts the embedded HTTP server and routes requests
     /// to RecordingManager, RecordingListManager, and RecordingOperations.
     /// Implements the Quest HTTP API contract for FieldData Pro phone control.
+    /// Auto-bootstraps at runtime — no need to manually add to the scene.
     /// </summary>
     public class HttpServerController : MonoBehaviour
     {
@@ -28,12 +29,16 @@ namespace RealityLog.Network
         [SerializeField] private RecordingListManager? recordingListManager;
         [SerializeField] private RecordingOperations? recordingOperations;
 
+
+
         [Header("Storage")]
         [Tooltip("Minimum free bytes required to start recording (500 MB)")]
         [SerializeField] private long minFreeStorageBytes = 524_288_000;
 
         private EmbeddedHttpServer? server;
         private float appStartTime;
+        private long appStartUnixMs; // For background-thread-safe uptime calc
+        private string cachedDataPath = ""; // Cache for background thread access
 
         // State tracked across start/stop for response metadata
         private string? currentRecordingFile;
@@ -44,6 +49,15 @@ namespace RealityLog.Network
         private readonly Dictionary<string, string> recordingMetadata = new();
 
         private static readonly Regex RecordingDirPattern = new(@"^\d{8}_\d{6}$", RegexOptions.Compiled);
+
+        // Cached status values (refreshed every Update, read lock-free by HTTP thread)
+        private volatile int cachedBattery = 100;
+        private long cachedStorageFree = long.MaxValue;
+        private long cachedStorageTotal = 0;
+        private volatile bool cachedIsRecording = false;
+        private float cachedDuration = 0f;
+        private string cachedAppVersion = "1.2.0";
+        private float lastStorageRefresh = 0f;
 
         private void Awake()
         {
@@ -60,6 +74,8 @@ namespace RealityLog.Network
 
         private void Start()
         {
+            cachedDataPath = Application.persistentDataPath; // Cache on main thread
+            appStartUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             server = new EmbeddedHttpServer(port);
             RegisterRoutes();
             server.Start();
@@ -68,6 +84,20 @@ namespace RealityLog.Network
         private void Update()
         {
             server?.ProcessMainThreadQueue();
+
+            // Refresh cached values on main thread (safe for JNI)
+            cachedIsRecording = recordingManager != null && recordingManager.IsRecording;
+            cachedDuration = recordingManager != null ? recordingManager.RecordingDuration : 0f;
+            cachedBattery = GetBatteryPercent();
+
+            // Refresh storage every 30 seconds (expensive JNI call)
+            if (Time.realtimeSinceStartup - lastStorageRefresh > 30f)
+            {
+                cachedStorageFree = GetStorageFreeBytes();
+                cachedStorageTotal = GetStorageTotalBytes();
+                cachedAppVersion = Application.version;
+                lastStorageRefresh = Time.realtimeSinceStartup;
+            }
         }
 
         private void OnDestroy()
@@ -98,32 +128,15 @@ namespace RealityLog.Network
 
         private HttpResponse HandleStatus(HttpRequest request)
         {
-            // Battery and storage can be read from background thread
-            int batteryPercent = GetBatteryPercent();
-            long storageFree = GetStorageFreeBytes();
-            long storageTotal = GetStorageTotalBytes();
-            long uptimeMs = (long)((Time.realtimeSinceStartup - appStartTime) * 1000);
+            // Read cached values — no main thread dispatch needed, no blocking
+            bool isRecording = cachedIsRecording;
+            string? currentFile = isRecording ? currentRecordingFile : null;
+            int durationMs = (int)(cachedDuration * 1000);
+            long uptimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - appStartUnixMs;
 
-            // Recording state must be read from main thread
-            bool isRecording = false;
-            float durationSec = 0f;
-            string? currentFile = null;
             long fileSizeBytes = 0;
-
-            var signal = server!.EnqueueOnMainThread(() =>
-            {
-                if (recordingManager != null)
-                {
-                    isRecording = recordingManager.IsRecording;
-                    durationSec = recordingManager.RecordingDuration;
-                    currentFile = isRecording ? currentRecordingFile : null;
-                }
-            });
-            signal.Wait(3000);
-
             if (isRecording && currentFile != null)
             {
-                // Try to get current file size
                 var videoPath = FindVideoFile(currentFile);
                 if (videoPath != null && File.Exists(videoPath))
                 {
@@ -131,20 +144,18 @@ namespace RealityLog.Network
                 }
             }
 
-            int durationMs = (int)(durationSec * 1000);
-
             var json = "{\n" +
                 $"  \"device\": \"MetaQuest3\",\n" +
-                $"  \"batteryPercent\": {batteryPercent},\n" +
-                $"  \"storageFreeBytes\": {storageFree},\n" +
-                $"  \"storageTotalBytes\": {storageTotal},\n" +
+                $"  \"batteryPercent\": {cachedBattery},\n" +
+                $"  \"storageFreeBytes\": {cachedStorageFree},\n" +
+                $"  \"storageTotalBytes\": {cachedStorageTotal},\n" +
                 $"  \"recording\": {{\n" +
                 $"    \"active\": {(isRecording ? "true" : "false")},\n" +
                 $"    \"currentFile\": {(currentFile != null ? $"\"{EscapeJson(currentFile)}\"" : "null")},\n" +
                 $"    \"durationMs\": {durationMs},\n" +
                 $"    \"fileSizeBytes\": {fileSizeBytes}\n" +
                 $"  }},\n" +
-                $"  \"apkVersion\": \"{EscapeJson(Application.version)}\",\n" +
+                $"  \"apkVersion\": \"{EscapeJson(cachedAppVersion)}\",\n" +
                 $"  \"uptimeMs\": {uptimeMs}\n" +
                 "}";
 
@@ -155,21 +166,24 @@ namespace RealityLog.Network
 
         private HttpResponse HandleStartRecording(HttpRequest request)
         {
-            // Check storage first
-            long freeBytes = GetStorageFreeBytes();
-            if (freeBytes < minFreeStorageBytes)
-            {
-                return HttpResponse.StorageFull(freeBytes, minFreeStorageBytes);
-            }
-
             bool alreadyRecording = false;
             bool success = false;
+            bool storageFull = false;
+            long freeBytes = 0;
             string? errorMessage = null;
 
             var signal = server!.EnqueueOnMainThread(() =>
             {
                 try
                 {
+                    // Storage check on main thread (JNI-safe)
+                    freeBytes = GetStorageFreeBytes();
+                    if (freeBytes > 0 && freeBytes < minFreeStorageBytes)
+                    {
+                        storageFull = true;
+                        return;
+                    }
+
                     if (recordingManager == null)
                     {
                         errorMessage = "RecordingManager not available";
@@ -204,6 +218,11 @@ namespace RealityLog.Network
                 }
             });
             signal.Wait(5000);
+
+            if (storageFull)
+            {
+                return HttpResponse.StorageFull(freeBytes, minFreeStorageBytes);
+            }
 
             if (alreadyRecording)
             {
@@ -576,45 +595,47 @@ namespace RealityLog.Network
             return (int)(SystemInfo.batteryLevel >= 0 ? SystemInfo.batteryLevel * 100 : 100);
         }
 
-        private static long GetStorageFreeBytes()
+        private long GetStorageFreeBytes()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-            try
+            // Try multiple paths — persistentDataPath may fail from background thread
+            string[] paths = { cachedDataPath, "/storage/emulated/0", "/data" };
+            foreach (var path in paths)
             {
-                using var statFs = new AndroidJavaObject("android.os.StatFs", Application.persistentDataPath);
-                long blockSize = statFs.Call<long>("getBlockSizeLong");
-                long availBlocks = statFs.Call<long>("getAvailableBlocksLong");
-                return blockSize * availBlocks;
+                if (string.IsNullOrEmpty(path)) continue;
+                try
+                {
+                    using var statFs = new AndroidJavaObject("android.os.StatFs", path);
+                    long blockSize = statFs.Call<long>("getBlockSizeLong");
+                    long availBlocks = statFs.Call<long>("getAvailableBlocksLong");
+                    long result = blockSize * availBlocks;
+                    if (result > 0) return result;
+                }
+                catch { }
             }
-            catch { }
 #endif
-            // Fallback: report from DriveInfo
-            try
-            {
-                var drive = new DriveInfo(Path.GetPathRoot(Application.persistentDataPath) ?? "/");
-                return drive.AvailableFreeSpace;
-            }
-            catch { return 0; }
+            return long.MaxValue; // If we can't determine, assume plenty of space
         }
 
-        private static long GetStorageTotalBytes()
+        private long GetStorageTotalBytes()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-            try
+            string[] paths = { cachedDataPath, "/storage/emulated/0", "/data" };
+            foreach (var path in paths)
             {
-                using var statFs = new AndroidJavaObject("android.os.StatFs", Application.persistentDataPath);
-                long blockSize = statFs.Call<long>("getBlockSizeLong");
-                long totalBlocks = statFs.Call<long>("getBlockCountLong");
-                return blockSize * totalBlocks;
+                if (string.IsNullOrEmpty(path)) continue;
+                try
+                {
+                    using var statFs = new AndroidJavaObject("android.os.StatFs", path);
+                    long blockSize = statFs.Call<long>("getBlockSizeLong");
+                    long totalBlocks = statFs.Call<long>("getBlockCountLong");
+                    long result = blockSize * totalBlocks;
+                    if (result > 0) return result;
+                }
+                catch { }
             }
-            catch { }
 #endif
-            try
-            {
-                var drive = new DriveInfo(Path.GetPathRoot(Application.persistentDataPath) ?? "/");
-                return drive.TotalSize;
-            }
-            catch { return 0; }
+            return 0;
         }
 
         private static string EscapeJson(string s)
