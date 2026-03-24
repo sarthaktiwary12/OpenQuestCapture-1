@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using UnityEngine;
 using RealityLog.Common;
+using RealityLog.Core;
 using RealityLog.FileOperations;
 using RealityLog.UI;
 
@@ -80,6 +81,11 @@ namespace RealityLog.Network
 
         private void Start()
         {
+            // Start foreground service FIRST — this is the critical fix that prevents
+            // Android from killing the app when it goes to background. Must happen
+            // before any other initialization so the process is protected immediately.
+            ForegroundServiceManager.StartService();
+
             cachedDataPath = Application.persistentDataPath; // Cache on main thread
             appStartUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             server = new EmbeddedHttpServer(port);
