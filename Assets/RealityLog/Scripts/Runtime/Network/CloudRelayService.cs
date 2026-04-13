@@ -321,7 +321,7 @@ namespace RealityLog.Network
                    $"\"recording\": {{\"active\": {(isRecording ? "true" : "false")}, " +
                    $"\"currentFile\": {(currentRecordingFile != null ? $"\"{EscapeJson(currentRecordingFile)}\"" : "null")}, " +
                    $"\"durationMs\": {durationMs}, \"fileSizeBytes\": 0}}, " +
-                   $"\"apkVersion\": \"{EscapeJson(cachedAppVersion)}\"}}";
+                   $"\"apkVersion\": \"{EscapeJson(cachedAppVersion)}|{EscapeJson(SnapshotUploadService.DiagStatus)}\"}}";
         }
 
         private string ExecuteMarkEpisode(string? payload)
