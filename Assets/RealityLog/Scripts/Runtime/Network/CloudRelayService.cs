@@ -9,6 +9,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using UnityEngine;
 using UnityEngine.Networking;
+using RealityLog;
 using RealityLog.Common;
 using RealityLog.UI;
 
@@ -141,6 +142,7 @@ namespace RealityLog.Network
                 recordingFile = isRecording ? (currentRecordingFile ?? "") : "",
                 apkVersion = cachedAppVersion,
                 ipAddress = ipAddress,
+                keepAwakeHealthy = KeepAwakeBootstrap.KeepAwakeHealthy,
             });
 
             var request = new UnityWebRequest($"{API_BASE}/api/v1/relay/devices/heartbeat", "POST");
@@ -495,6 +497,13 @@ namespace RealityLog.Network
             public string recordingFile = "";
             public string apkVersion = "";
             public string ipAddress = "";
+            /// <summary>
+            /// False when KeepAwakeBootstrap's setprop readback failed three
+            /// times in a row. The dashboard highlights devices with
+            /// keepAwakeHealthy=false because they will likely force-sleep
+            /// the next time the headset is taken off.
+            /// </summary>
+            public bool keepAwakeHealthy = true;
         }
 
         [Serializable]
