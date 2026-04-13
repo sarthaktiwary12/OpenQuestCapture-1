@@ -497,6 +497,13 @@ namespace RealityLog
             }
         }
 
+        /// <summary>
+        /// Session-level integrity check. In addition to the old size-only
+        /// smoke test, this now runs the MP4 atom scan (ftyp/moov/mdat) and
+        /// MCAP magic-bytes + footer check from SessionValidators. On any
+        /// failure we write a `session_corrupt.txt` breadcrumb alongside the
+        /// recording so the phone/HTTP layer can expose the status.
+        /// </summary>
         private void ValidateSavedSession(string sessionDirectoryName)
         {
             try
@@ -504,32 +511,65 @@ namespace RealityLog
                 var sessionDir = Path.Join(Application.persistentDataPath, sessionDirectoryName);
                 var videoPath = Path.Join(sessionDir, "center_camera.mp4");
 
-                var videoOk = File.Exists(videoPath) && new FileInfo(videoPath).Length >= MinExpectedVideoBytes;
+                string? corruptReason = null;
+
+                if (File.Exists(videoPath))
+                {
+                    if (new FileInfo(videoPath).Length < MinExpectedVideoBytes)
+                    {
+                        corruptReason = $"mp4:too_small({new FileInfo(videoPath).Length}B)";
+                    }
+                    else
+                    {
+                        var mp4 = RealityLog.Common.SessionValidators.ValidateMp4(videoPath);
+                        if (mp4 != RealityLog.Common.SessionValidators.Mp4Status.Valid)
+                            corruptReason = $"mp4:{mp4}";
+                    }
+                }
+                else
+                {
+                    corruptReason = "mp4:missing";
+                }
+
+                if (corruptReason == null && Directory.Exists(sessionDir))
+                {
+                    foreach (var mcap in Directory.GetFiles(sessionDir, "*.mcap", SearchOption.AllDirectories))
+                    {
+                        var st = RealityLog.Common.SessionValidators.ValidateMcap(mcap);
+                        if (st != RealityLog.Common.SessionValidators.McapStatus.Valid)
+                        {
+                            corruptReason = $"mcap:{Path.GetFileName(mcap)}:{st}";
+                            break;
+                        }
+                    }
+                }
+
                 var motionOk = false;
                 foreach (var fileName in MotionFileNames)
                 {
                     var motionPath = Path.Join(sessionDir, fileName);
-                    if (!File.Exists(motionPath))
-                    {
-                        continue;
-                    }
-
-                    if (new FileInfo(motionPath).Length > 0)
+                    if (File.Exists(motionPath) && new FileInfo(motionPath).Length > 0)
                     {
                         motionOk = true;
                         break;
                     }
                 }
 
-                if (videoOk && motionOk)
+                if (corruptReason == null && motionOk)
                 {
                     return;
                 }
 
-                var videoBytes = File.Exists(videoPath) ? new FileInfo(videoPath).Length : 0L;
+                if (corruptReason == null && !motionOk)
+                {
+                    corruptReason = "motion:all_streams_empty";
+                }
+
+                try { File.WriteAllText(Path.Join(sessionDir, "session_corrupt.txt"), corruptReason ?? "unknown"); }
+                catch { /* best effort */ }
+
                 Debug.LogWarning(
-                    $"[{Constants.LOG_TAG}] RecordingManager: Session integrity warning for '{sessionDirectoryName}'. " +
-                    $"video_bytes={videoBytes}, has_motion_stream={motionOk}"
+                    $"[{Constants.LOG_TAG}] RecordingManager: Session marked CORRUPT for '{sessionDirectoryName}': {corruptReason}"
                 );
             }
             catch (Exception ex)
