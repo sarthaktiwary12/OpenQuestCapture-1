@@ -32,10 +32,36 @@ namespace RealityLog.Network
         // For wildcard routes like /api/recordings/:filename
         private readonly List<(string prefix, string method, Func<HttpRequest, HttpResponse> handler)> wildcardRoutes = new();
 
+        // ── Auth ──
+        //
+        // Bearer token regenerated on every boot by HttpServerController and
+        // pushed to the server via SetBearerToken(). Once set, every request
+        // that is NOT on the exempt list must carry
+        //     Authorization: Bearer <token>
+        // or the server replies 401 before routing.
+        //
+        // The `/api/pair-token` endpoint is bound to loopback only so that the
+        // phone can discover the token over USB without exposing it to anyone
+        // else on the Wi-Fi.
+        private volatile string? bearerToken;
+        private readonly HashSet<string> authExemptPaths = new(StringComparer.OrdinalIgnoreCase);
+
         public EmbeddedHttpServer(int port = 8080)
         {
             Port = port;
         }
+
+        /// <summary>
+        /// Install the current bearer token. Passing null disables auth
+        /// (used for Editor / headless test harness only).
+        /// </summary>
+        public void SetBearerToken(string? token) => bearerToken = token;
+
+        /// <summary>
+        /// Mark a path as reachable without the bearer header. Used for the
+        /// loopback-only pair-token endpoint and nothing else.
+        /// </summary>
+        public void ExemptFromAuth(string path) => authExemptPaths.Add(path);
 
         // ── Route registration ──
 
@@ -184,6 +210,15 @@ namespace RealityLog.Network
                         return;
                     }
 
+                    // Tag loopback calls so loopback-only endpoints can enforce
+                    // "must come from adb-forwarded localhost" without a second pass.
+                    try
+                    {
+                        var remoteIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+                        request.IsLoopback = remoteIp != null && IPAddress.IsLoopback(remoteIp);
+                    }
+                    catch { request.IsLoopback = false; }
+
                     var response = RouteRequest(request);
                     if (response.FileStreamPath != null)
                     {
@@ -292,6 +327,31 @@ namespace RealityLog.Network
             {
                 Debug.Log($"[{Constants.LOG_TAG}] HTTP: {request.Method} {request.Path}");
 
+                // ── Auth gate ──
+                // Reject unauthenticated requests up-front. Exempt paths are
+                // still gated: they must come from the loopback interface so
+                // they cannot be used as an unauth bypass by a LAN attacker.
+                var expectedToken = bearerToken;
+                if (!string.IsNullOrEmpty(expectedToken))
+                {
+                    bool exempt = authExemptPaths.Contains(request.Path);
+                    if (exempt)
+                    {
+                        if (!request.IsLoopback)
+                        {
+                            return HttpResponse.Unauthorized("exempt endpoint available on loopback only");
+                        }
+                    }
+                    else
+                    {
+                        request.Headers.TryGetValue(RealityLog.Common.AuthTokenManager.AuthHeader, out var authHeader);
+                        if (!RealityLog.Common.AuthTokenManager.IsAuthorized(authHeader, expectedToken!))
+                        {
+                            return HttpResponse.Unauthorized("missing or invalid bearer token");
+                        }
+                    }
+                }
+
                 // Try exact match first
                 Dictionary<string, Func<HttpRequest, HttpResponse>>? routes = request.Method switch
                 {
@@ -334,7 +394,9 @@ namespace RealityLog.Network
             sb.Append($"HTTP/1.1 {response.StatusCode} {response.StatusText}\r\n");
             sb.Append($"Content-Type: {response.ContentType}\r\n");
             sb.Append($"Content-Length: {bodyBytes.Length}\r\n");
-            sb.Append("Access-Control-Allow-Origin: *\r\n");
+            // CORS removed: we explicitly do not want browsers on the LAN
+            // to be able to call the Quest HTTP API. The phone app is the
+            // only legitimate caller and it sends the bearer directly.
             sb.Append("Connection: close\r\n");
             sb.Append("\r\n");
 
@@ -388,7 +450,9 @@ namespace RealityLog.Network
             sb.Append($"Content-Type: {response.ContentType}\r\n");
             sb.Append($"Content-Length: {contentLength}\r\n");
             sb.Append("Accept-Ranges: bytes\r\n");
-            sb.Append("Access-Control-Allow-Origin: *\r\n");
+            // CORS removed: we explicitly do not want browsers on the LAN
+            // to be able to call the Quest HTTP API. The phone app is the
+            // only legitimate caller and it sends the bearer directly.
             sb.Append("Connection: close\r\n");
             sb.Append("\r\n");
 
@@ -424,6 +488,8 @@ namespace RealityLog.Network
         public Dictionary<string, string> QueryParams { get; set; } = new();
         public Dictionary<string, string> Headers { get; set; } = new();
         public string Body { get; set; } = "";
+        /// <summary>True when the connection came from 127.0.0.1 / ::1.</summary>
+        public bool IsLoopback { get; set; }
     }
 
     public class HttpResponse
@@ -452,6 +518,12 @@ namespace RealityLog.Network
         public static HttpResponse BadRequest(string message) => Json(400,
             $"{{\"error\":\"bad_request\",\"message\":\"{EscapeJson(message)}\"}}");
 
+        public static HttpResponse Unauthorized(string message) => Json(401,
+            $"{{\"error\":\"unauthorized\",\"message\":\"{EscapeJson(message)}\"}}");
+
+        public static HttpResponse Corrupt(string sessionId, string reason) => Json(422,
+            $"{{\"error\":\"corrupt\",\"session\":\"{EscapeJson(sessionId)}\",\"reason\":\"{EscapeJson(reason)}\"}}");
+
         public static HttpResponse InternalError(string message) => Json(500,
             $"{{\"error\":\"internal_error\",\"message\":\"{EscapeJson(message)}\"}}");
 
@@ -471,8 +543,10 @@ namespace RealityLog.Network
             200 => "OK",
             206 => "Partial Content",
             400 => "Bad Request",
+            401 => "Unauthorized",
             404 => "Not Found",
             409 => "Conflict",
+            422 => "Unprocessable Entity",
             500 => "Internal Server Error",
             507 => "Insufficient Storage",
             _ => "Unknown"

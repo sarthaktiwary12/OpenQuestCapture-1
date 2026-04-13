@@ -41,6 +41,16 @@ namespace RealityLog.Network
         private long appStartUnixMs; // For background-thread-safe uptime calc
         private string cachedDataPath = ""; // Cache for background thread access
 
+        /// <summary>
+        /// Bearer token generated on boot. Displayed in the HUD and handed to
+        /// the phone over the loopback-only /api/pair-token endpoint.
+        /// </summary>
+        public string? BearerToken { get; private set; }
+
+        // Location the phone reads from (over adb reverse / USB) to discover
+        // the bearer token without ever seeing it over Wi-Fi.
+        private string TokenFilePath => Path.Combine(Application.persistentDataPath, "pair_token.txt");
+
         // State tracked across start/stop for response metadata
         private string? currentRecordingFile;
         private string? currentRecordingStartedAt;
@@ -89,8 +99,26 @@ namespace RealityLog.Network
             cachedDataPath = Application.persistentDataPath; // Cache on main thread
             appStartUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             server = new EmbeddedHttpServer(port);
+
+            // Generate a fresh bearer on every boot and write it to a file the
+            // phone can slurp via `adb reverse` → `/api/pair-token`. See
+            // docs/vr-manual-verification.md for how to pair.
+            BearerToken = AuthTokenManager.GenerateBearerToken();
+            try
+            {
+                AuthTokenManager.WriteTokenFile(TokenFilePath, BearerToken);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] HttpServerController: Could not persist pair token: {ex.Message}");
+            }
+            server.SetBearerToken(BearerToken);
+            server.ExemptFromAuth("/api/pair-token");
+
             RegisterRoutes();
             server.Start();
+            Debug.Log($"[{Constants.LOG_TAG}] HttpServerController: Bearer token generated (len={BearerToken.Length}). First chars: {BearerToken.Substring(0, Math.Min(4, BearerToken.Length))}…");
+            ShowTokenInHud(BearerToken);
 
             // Auto-apply keep-awake so Quest never sleeps when headset is removed
             ApplyKeepAwakeSettings();
@@ -167,6 +195,7 @@ namespace RealityLog.Network
         {
             if (server == null) return;
 
+            server.Get("/api/pair-token", HandlePairToken);
             server.Get("/api/status", HandleStatus);
             server.Post("/api/start-recording", HandleStartRecording);
             server.Post("/api/stop-recording", HandleStopRecording);
@@ -734,6 +763,48 @@ namespace RealityLog.Network
 
             Debug.Log($"[{Constants.LOG_TAG}] Diagnostics requested — IPs: {string.Join(", ", interfaces)}");
             return HttpResponse.Ok(json);
+        }
+
+        // ── GET /api/pair-token (loopback only) ──
+        //
+        // The phone runs `adb reverse tcp:9555 tcp:8080` during pairing, then
+        // calls http://127.0.0.1:9555/api/pair-token. The loopback check in
+        // EmbeddedHttpServer rejects any non-loopback caller with 401 even
+        // though the path itself is marked exempt from bearer auth.
+
+        private HttpResponse HandlePairToken(HttpRequest request)
+        {
+            if (BearerToken == null)
+            {
+                return HttpResponse.InternalError("token not yet initialised");
+            }
+            var json = $"{{\"token\":\"{EscapeJson(BearerToken)}\",\"header\":\"{AuthTokenManager.AuthHeader}\",\"scheme\":\"Bearer\"}}";
+            return HttpResponse.Ok(json);
+        }
+
+        /// <summary>
+        /// Surface the bearer token inside the VR HUD so a trusted operator
+        /// can read it off the headset if the USB-pairing path fails. Only
+        /// the first 6 chars are shown alongside a short fingerprint — the
+        /// full token never hits a log line outside this method.
+        /// </summary>
+        private void ShowTokenInHud(string token)
+        {
+            try
+            {
+                var go = new GameObject("PairTokenHUD");
+                var mesh = go.AddComponent<TextMesh>();
+                mesh.characterSize = 0.004f;
+                mesh.fontSize = 80;
+                mesh.anchor = TextAnchor.UpperLeft;
+                mesh.color = new Color(1f, 1f, 0f, 0.5f);
+                var preview = token.Substring(0, Math.Min(6, token.Length));
+                mesh.text = $"pair: {preview}…";
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] HttpServerController: Could not render pair HUD: {ex.Message}");
+            }
         }
 
         // ── Helpers ──

@@ -17,7 +17,9 @@ namespace RealityLog.Network
     public class SnapshotUploadService : MonoBehaviour
     {
         private const string API_BASE = "https://fielddata-pro-api.sarthak-46e.workers.dev";
-        private const string API_KEY = "fielddata-pro-2024";
+        // Externalised — see AuthTokenManager.DefaultRelayKeyPath. Shared with
+        // CloudRelayService so rotating the file rotates both.
+        private static string? _apiKey;
         private const float UPLOAD_INTERVAL = 2f;
         private const int JPEG_QUALITY = 15;
 
@@ -106,7 +108,15 @@ namespace RealityLog.Network
             var url = $"{API_BASE}/api/v1/relay/devices/{deviceId}/snapshot";
             var request = new UnityWebRequest(url, "PUT");
             request.SetRequestHeader("Content-Type", "image/jpeg");
-            request.SetRequestHeader("X-API-Key", API_KEY);
+            var apiKey = ResolveApiKey();
+            if (apiKey == null)
+            {
+                DiagStatus = "err:relay_key_missing";
+                request.Dispose();
+                isUploading = false;
+                yield break;
+            }
+            request.SetRequestHeader("X-API-Key", apiKey);
             request.uploadHandler = new UploadHandlerRaw(jpegBytes);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.timeout = 5;
@@ -128,6 +138,13 @@ namespace RealityLog.Network
 
             request.Dispose();
             isUploading = false;
+        }
+
+        private static string? ResolveApiKey()
+        {
+            if (_apiKey != null) return _apiKey;
+            _apiKey = AuthTokenManager.LoadRelayKey(AuthTokenManager.DefaultRelayKeyPath);
+            return _apiKey;
         }
     }
 }

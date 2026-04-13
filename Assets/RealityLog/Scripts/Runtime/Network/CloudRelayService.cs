@@ -22,7 +22,11 @@ namespace RealityLog.Network
     public class CloudRelayService : MonoBehaviour
     {
         private const string API_BASE = "https://fielddata-pro-api.sarthak-46e.workers.dev";
-        private const string API_KEY = "fielddata-pro-2024";
+        // API_KEY is NO LONGER a constant — it is loaded lazily from an
+        // on-device file (see AuthTokenManager.DefaultRelayKeyPath) so the
+        // key can be rotated without rebuilding and shipping a new APK.
+        // A missing file fails closed: we refuse to send any payload.
+        private static string? _apiKey;
         private const float POLL_INTERVAL = 1.5f;
 
         private string deviceId = "";
@@ -141,7 +145,14 @@ namespace RealityLog.Network
 
             var request = new UnityWebRequest($"{API_BASE}/api/v1/relay/devices/heartbeat", "POST");
             request.SetRequestHeader("Content-Type", "application/json");
-            request.SetRequestHeader("X-API-Key", API_KEY);
+            var apiKey = ResolveApiKey();
+            if (apiKey == null)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] CloudRelay: relay key missing at {AuthTokenManager.DefaultRelayKeyPath} — skipping request");
+                request.Dispose();
+                yield break;
+            }
+            request.SetRequestHeader("X-API-Key", apiKey);
             request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(heartbeat));
             request.downloadHandler = new DownloadHandlerBuffer();
             request.timeout = 10;
@@ -355,7 +366,14 @@ namespace RealityLog.Network
 
             var request = new UnityWebRequest($"{API_BASE}/api/v1/relay/commands/{commandId}/result", "POST");
             request.SetRequestHeader("Content-Type", "application/json");
-            request.SetRequestHeader("X-API-Key", API_KEY);
+            var apiKey = ResolveApiKey();
+            if (apiKey == null)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] CloudRelay: relay key missing at {AuthTokenManager.DefaultRelayKeyPath} — skipping request");
+                request.Dispose();
+                yield break;
+            }
+            request.SetRequestHeader("X-API-Key", apiKey);
             request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
             request.downloadHandler = new DownloadHandlerBuffer();
             request.timeout = 10;
@@ -412,6 +430,18 @@ namespace RealityLog.Network
         {
             if (string.IsNullOrEmpty(s)) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
+        }
+
+        /// <summary>
+        /// Resolve the relay API key from the on-device key file. Cached after
+        /// first successful read; a deliberate return of null signals the
+        /// caller to fail closed (do not transmit) rather than use a default.
+        /// </summary>
+        private static string? ResolveApiKey()
+        {
+            if (_apiKey != null) return _apiKey;
+            _apiKey = AuthTokenManager.LoadRelayKey(AuthTokenManager.DefaultRelayKeyPath);
+            return _apiKey;
         }
 
         // ── Device number HUD ──
