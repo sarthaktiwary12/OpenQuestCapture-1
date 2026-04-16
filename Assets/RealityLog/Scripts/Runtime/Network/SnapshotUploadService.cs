@@ -20,8 +20,12 @@ namespace RealityLog.Network
         // Externalised — see AuthTokenManager.DefaultRelayKeyPath. Shared with
         // CloudRelayService so rotating the file rotates both.
         private static string? _apiKey;
-        private const float UPLOAD_INTERVAL = 2f;
+        private const float UPLOAD_INTERVAL = 4f;
         private const int JPEG_QUALITY = 15;
+        // Back off when the backend or network keeps failing, so we don't
+        // hammer the radio on a device that can't reach the relay right now.
+        private const int BACKOFF_AFTER_CONSECUTIVE_FAILS = 5;
+        private const float BACKOFF_INTERVAL = 30f;
 
         private string deviceId = "";
         private RecordingManager? recordingManager;
@@ -30,6 +34,7 @@ namespace RealityLog.Network
         private bool isUploading = false;
         private int uploadCount = 0;
         private int failCount = 0;
+        private int consecutiveFails = 0;
         private string lastError = "";
 
         /// <summary>Diagnostic string for heartbeat reporting.</summary>
@@ -86,9 +91,16 @@ namespace RealityLog.Network
             {
                 if (recordingManager != null && recordingManager.IsRecording && !isUploading)
                 {
+                    // Upload is wrapped in its own try/catch — this yield is
+                    // intentionally outside try so the coroutine itself can never
+                    // throw and kill the service.
                     yield return UploadSnapshot();
                 }
-                yield return new WaitForSeconds(UPLOAD_INTERVAL);
+                // Back off hard when the relay is unreachable — keeps radio quiet.
+                var delay = consecutiveFails >= BACKOFF_AFTER_CONSECUTIVE_FAILS
+                    ? BACKOFF_INTERVAL
+                    : UPLOAD_INTERVAL;
+                yield return new WaitForSeconds(delay);
             }
         }
 
@@ -96,7 +108,22 @@ namespace RealityLog.Network
         {
             if (imageReader == null) yield break;
 
-            byte[]? jpegBytes = imageReader.GetSnapshotJpeg(JPEG_QUALITY);
+            // Capturing the JPEG crosses JNI into Kotlin — any exception here
+            // must be contained so the service never kills the VR app.
+            byte[]? jpegBytes = null;
+            try
+            {
+                jpegBytes = imageReader.GetSnapshotJpeg(JPEG_QUALITY);
+            }
+            catch (Exception ex)
+            {
+                failCount++;
+                consecutiveFails++;
+                lastError = $"jpeg_ex:{ex.Message}";
+                DiagStatus = $"running:{lastError}(ok={uploadCount},fail={failCount})";
+                yield break;
+            }
+
             if (jpegBytes == null || jpegBytes.Length == 0)
             {
                 DiagStatus = $"running:jpeg_null(ok={uploadCount},fail={failCount})";
@@ -105,39 +132,68 @@ namespace RealityLog.Network
 
             isUploading = true;
 
-            var url = $"{API_BASE}/api/v1/relay/devices/{deviceId}/snapshot";
-            var request = new UnityWebRequest(url, "PUT");
-            request.SetRequestHeader("Content-Type", "image/jpeg");
-            var apiKey = ResolveApiKey();
-            if (apiKey == null)
+            UnityWebRequest? request = null;
+            try
             {
-                DiagStatus = "err:relay_key_missing";
-                request.Dispose();
+                var url = $"{API_BASE}/api/v1/relay/devices/{deviceId}/snapshot";
+                request = new UnityWebRequest(url, "PUT");
+                request.SetRequestHeader("Content-Type", "image/jpeg");
+                var apiKey = ResolveApiKey();
+                if (apiKey == null)
+                {
+                    DiagStatus = "err:relay_key_missing";
+                    request.Dispose();
+                    request = null;
+                    isUploading = false;
+                    yield break;
+                }
+                request.SetRequestHeader("X-API-Key", apiKey);
+                request.uploadHandler = new UploadHandlerRaw(jpegBytes);
+                request.downloadHandler = new DownloadHandlerBuffer();
+                request.timeout = 5;
+            }
+            catch (Exception ex)
+            {
+                failCount++;
+                consecutiveFails++;
+                lastError = $"req_ex:{ex.Message}";
+                DiagStatus = $"running:{lastError}(ok={uploadCount},fail={failCount})";
+                request?.Dispose();
                 isUploading = false;
                 yield break;
             }
-            request.SetRequestHeader("X-API-Key", apiKey);
-            request.uploadHandler = new UploadHandlerRaw(jpegBytes);
-            request.downloadHandler = new DownloadHandlerBuffer();
-            request.timeout = 5;
 
             yield return request.SendWebRequest();
 
-            if (request.result != UnityWebRequest.Result.Success)
+            try
+            {
+                if (request.result != UnityWebRequest.Result.Success)
+                {
+                    failCount++;
+                    consecutiveFails++;
+                    lastError = request.error ?? "unknown";
+                    DiagStatus = $"running:upload_err={lastError}(ok={uploadCount},fail={failCount})";
+                    Debug.LogWarning($"[{Constants.LOG_TAG}] SnapshotUpload: Failed: {request.error}");
+                }
+                else
+                {
+                    uploadCount++;
+                    consecutiveFails = 0;
+                    DiagStatus = $"running:ok(ok={uploadCount},fail={failCount},size={jpegBytes.Length})";
+                }
+            }
+            catch (Exception ex)
             {
                 failCount++;
-                lastError = request.error ?? "unknown";
-                DiagStatus = $"running:upload_err={lastError}(ok={uploadCount},fail={failCount})";
-                Debug.LogWarning($"[{Constants.LOG_TAG}] SnapshotUpload: Failed: {request.error}");
+                consecutiveFails++;
+                lastError = $"post_ex:{ex.Message}";
+                DiagStatus = $"running:{lastError}(ok={uploadCount},fail={failCount})";
             }
-            else
+            finally
             {
-                uploadCount++;
-                DiagStatus = $"running:ok(ok={uploadCount},fail={failCount},size={jpegBytes.Length})";
+                request.Dispose();
+                isUploading = false;
             }
-
-            request.Dispose();
-            isUploading = false;
         }
 
         private static string? ResolveApiKey()
