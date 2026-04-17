@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections;
+using System.IO;
 using System.Text;
 using UnityEngine;
 using UnityEngine.Networking;
@@ -200,6 +201,9 @@ namespace RealityLog.Network
         {
             if (_apiKey != null) return _apiKey;
             _apiKey = AuthTokenManager.LoadRelayKey(AuthTokenManager.DefaultRelayKeyPath);
+            if (_apiKey != null) return _apiKey;
+            var sandbox = Path.Combine(UnityEngine.Application.persistentDataPath, "fielddata", "relay_api_key.txt");
+            _apiKey = AuthTokenManager.LoadRelayKey(sandbox);
             return _apiKey;
         }
     }

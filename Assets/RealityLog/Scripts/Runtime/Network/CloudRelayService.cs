@@ -442,7 +442,14 @@ namespace RealityLog.Network
         private static string? ResolveApiKey()
         {
             if (_apiKey != null) return _apiKey;
+            // /sdcard path only works on grandfathered legacy-storage installs;
+            // on fresh installs with targetSdk=32 scoped storage blocks it.
             _apiKey = AuthTokenManager.LoadRelayKey(AuthTokenManager.DefaultRelayKeyPath);
+            if (_apiKey != null) return _apiKey;
+            // App-sandbox fallback — always readable by the app regardless of
+            // scoped storage. Operators drop the key here on fresh installs.
+            var sandbox = Path.Combine(Application.persistentDataPath, "fielddata", "relay_api_key.txt");
+            _apiKey = AuthTokenManager.LoadRelayKey(sandbox);
             return _apiKey;
         }
 
