@@ -9,6 +9,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using UnityEngine;
 using UnityEngine.Networking;
+using RealityLog;
 using RealityLog.Common;
 using RealityLog.UI;
 
@@ -22,7 +23,11 @@ namespace RealityLog.Network
     public class CloudRelayService : MonoBehaviour
     {
         private const string API_BASE = "https://fielddata-pro-api.sarthak-46e.workers.dev";
-        private const string API_KEY = "fielddata-pro-2024";
+        // API_KEY is NO LONGER a constant — it is loaded lazily from an
+        // on-device file (see AuthTokenManager.DefaultRelayKeyPath) so the
+        // key can be rotated without rebuilding and shipping a new APK.
+        // A missing file fails closed: we refuse to send any payload.
+        private static string? _apiKey;
         private const float POLL_INTERVAL = 1.5f;
 
         private string deviceId = "";
@@ -137,11 +142,19 @@ namespace RealityLog.Network
                 recordingFile = isRecording ? (currentRecordingFile ?? "") : "",
                 apkVersion = cachedAppVersion,
                 ipAddress = ipAddress,
+                keepAwakeHealthy = KeepAwakeBootstrap.KeepAwakeHealthy,
             });
 
             var request = new UnityWebRequest($"{API_BASE}/api/v1/relay/devices/heartbeat", "POST");
             request.SetRequestHeader("Content-Type", "application/json");
-            request.SetRequestHeader("X-API-Key", API_KEY);
+            var apiKey = ResolveApiKey();
+            if (apiKey == null)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] CloudRelay: relay key missing at {AuthTokenManager.DefaultRelayKeyPath} — skipping request");
+                request.Dispose();
+                yield break;
+            }
+            request.SetRequestHeader("X-API-Key", apiKey);
             request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(heartbeat));
             request.downloadHandler = new DownloadHandlerBuffer();
             request.timeout = 10;
@@ -321,7 +334,7 @@ namespace RealityLog.Network
                    $"\"recording\": {{\"active\": {(isRecording ? "true" : "false")}, " +
                    $"\"currentFile\": {(currentRecordingFile != null ? $"\"{EscapeJson(currentRecordingFile)}\"" : "null")}, " +
                    $"\"durationMs\": {durationMs}, \"fileSizeBytes\": 0}}, " +
-                   $"\"apkVersion\": \"{EscapeJson(cachedAppVersion)}\"}}";
+                   $"\"apkVersion\": \"{EscapeJson(cachedAppVersion)}|{EscapeJson(SnapshotUploadService.DiagStatus)}\"}}";
         }
 
         private string ExecuteMarkEpisode(string? payload)
@@ -355,7 +368,14 @@ namespace RealityLog.Network
 
             var request = new UnityWebRequest($"{API_BASE}/api/v1/relay/commands/{commandId}/result", "POST");
             request.SetRequestHeader("Content-Type", "application/json");
-            request.SetRequestHeader("X-API-Key", API_KEY);
+            var apiKey = ResolveApiKey();
+            if (apiKey == null)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] CloudRelay: relay key missing at {AuthTokenManager.DefaultRelayKeyPath} — skipping request");
+                request.Dispose();
+                yield break;
+            }
+            request.SetRequestHeader("X-API-Key", apiKey);
             request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
             request.downloadHandler = new DownloadHandlerBuffer();
             request.timeout = 10;
@@ -414,6 +434,25 @@ namespace RealityLog.Network
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
         }
 
+        /// <summary>
+        /// Resolve the relay API key from the on-device key file. Cached after
+        /// first successful read; a deliberate return of null signals the
+        /// caller to fail closed (do not transmit) rather than use a default.
+        /// </summary>
+        private static string? ResolveApiKey()
+        {
+            if (_apiKey != null) return _apiKey;
+            // /sdcard path only works on grandfathered legacy-storage installs;
+            // on fresh installs with targetSdk=32 scoped storage blocks it.
+            _apiKey = AuthTokenManager.LoadRelayKey(AuthTokenManager.DefaultRelayKeyPath);
+            if (_apiKey != null) return _apiKey;
+            // App-sandbox fallback — always readable by the app regardless of
+            // scoped storage. Operators drop the key here on fresh installs.
+            var sandbox = Path.Combine(Application.persistentDataPath, "fielddata", "relay_api_key.txt");
+            _apiKey = AuthTokenManager.LoadRelayKey(sandbox);
+            return _apiKey;
+        }
+
         // ── Device number HUD ──
 
         private void UpdateDeviceNumberLabel()
@@ -465,6 +504,13 @@ namespace RealityLog.Network
             public string recordingFile = "";
             public string apkVersion = "";
             public string ipAddress = "";
+            /// <summary>
+            /// False when KeepAwakeBootstrap's setprop readback failed three
+            /// times in a row. The dashboard highlights devices with
+            /// keepAwakeHealthy=false because they will likely force-sleep
+            /// the next time the headset is taken off.
+            /// </summary>
+            public bool keepAwakeHealthy = true;
         }
 
         [Serializable]

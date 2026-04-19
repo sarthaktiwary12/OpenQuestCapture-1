@@ -139,6 +139,29 @@ namespace RealityLog.Camera
             }
         }
 
+        /// <summary>
+        /// Returns the latest camera frame as a low-quality JPEG for live preview.
+        /// Returns null if no frame is available or the instance is not initialized.
+        /// </summary>
+        public byte[]? GetSnapshotJpeg(int quality = 30)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (currentInstance == null) return null;
+            try
+            {
+                var result = currentInstance.Call<byte[]>("getSnapshotJpeg", quality);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] ImageReaderSurfaceProvider: GetSnapshotJpeg failed: {ex.Message}");
+                return null;
+            }
+#else
+            return null;
+#endif
+        }
+
         private void OnDestroy()
         {
             Close();

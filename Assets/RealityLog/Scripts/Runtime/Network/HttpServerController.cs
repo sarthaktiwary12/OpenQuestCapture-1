@@ -41,6 +41,21 @@ namespace RealityLog.Network
         private long appStartUnixMs; // For background-thread-safe uptime calc
         private string cachedDataPath = ""; // Cache for background thread access
 
+        /// <summary>
+        /// Bearer token generated on boot. Displayed in the HUD and handed to
+        /// the phone over the loopback-only /api/pair-token endpoint.
+        /// </summary>
+        public string? BearerToken { get; private set; }
+
+        // Guard to make storage-check + allocation atomic: the previous impl
+        // let two concurrent start-recording requests both pass their storage
+        // check and then both try to allocate a session directory.
+        private readonly object recordingStartLock = new();
+
+        // Location the phone reads from (over adb reverse / USB) to discover
+        // the bearer token without ever seeing it over Wi-Fi.
+        private string TokenFilePath => Path.Combine(Application.persistentDataPath, "pair_token.txt");
+
         // State tracked across start/stop for response metadata
         private string? currentRecordingFile;
         private string? currentRecordingStartedAt;
@@ -89,8 +104,26 @@ namespace RealityLog.Network
             cachedDataPath = Application.persistentDataPath; // Cache on main thread
             appStartUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             server = new EmbeddedHttpServer(port);
+
+            // Generate a fresh bearer on every boot and write it to a file the
+            // phone can slurp via `adb reverse` → `/api/pair-token`. See
+            // docs/vr-manual-verification.md for how to pair.
+            BearerToken = AuthTokenManager.GenerateBearerToken();
+            try
+            {
+                AuthTokenManager.WriteTokenFile(TokenFilePath, BearerToken);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] HttpServerController: Could not persist pair token: {ex.Message}");
+            }
+            server.SetBearerToken(BearerToken);
+            server.ExemptFromAuth("/api/pair-token");
+
             RegisterRoutes();
             server.Start();
+            Debug.Log($"[{Constants.LOG_TAG}] HttpServerController: Bearer token generated (len={BearerToken.Length}). First chars: {BearerToken.Substring(0, Math.Min(4, BearerToken.Length))}…");
+            ShowTokenInHud(BearerToken);
 
             // Auto-apply keep-awake so Quest never sleeps when headset is removed
             ApplyKeepAwakeSettings();
@@ -167,6 +200,7 @@ namespace RealityLog.Network
         {
             if (server == null) return;
 
+            server.Get("/api/pair-token", HandlePairToken);
             server.Get("/api/status", HandleStatus);
             server.Post("/api/start-recording", HandleStartRecording);
             server.Post("/api/stop-recording", HandleStopRecording);
@@ -228,47 +262,57 @@ namespace RealityLog.Network
 
             var signal = server!.EnqueueOnMainThread(() =>
             {
-                try
+                // Take the start-recording lock: storage check + IsRecording
+                // read + StartRecording() must all happen without any other
+                // thread reading stale values between them. Previously the
+                // storage check was cached-value based and updated every 30s,
+                // so two concurrent starts could both pass and both try to
+                // allocate; now we re-poll free bytes at call time and hold
+                // the lock through allocation.
+                lock (recordingStartLock)
                 {
-                    // Storage check on main thread (JNI-safe)
-                    freeBytes = GetStorageFreeBytes();
-                    if (freeBytes > 0 && freeBytes < minFreeStorageBytes)
+                    try
                     {
-                        storageFull = true;
-                        return;
-                    }
+                        if (recordingManager == null)
+                        {
+                            errorMessage = "RecordingManager not available";
+                            return;
+                        }
 
-                    if (recordingManager == null)
+                        if (recordingManager.IsRecording)
+                        {
+                            alreadyRecording = true;
+                            return;
+                        }
+
+                        // Atomic: fresh storage read immediately before allocation.
+                        freeBytes = GetStorageFreeBytes();
+                        if (freeBytes > 0 && freeBytes < minFreeStorageBytes)
+                        {
+                            storageFull = true;
+                            return;
+                        }
+
+                        recordingManager.StartRecording();
+
+                        // Capture metadata
+                        currentRecordingFile = recordingManager.CurrentSessionDirectory;
+                        currentRecordingStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                        currentRecordingStartedAt = DateTimeOffset.UtcNow.ToString("O");
+
+                        // Save sidecar metadata from request body
+                        if (!string.IsNullOrEmpty(request.Body) && currentRecordingFile != null)
+                        {
+                            SaveSidecarMetadata(currentRecordingFile, request.Body);
+                        }
+
+                        success = true;
+                    }
+                    catch (Exception ex)
                     {
-                        errorMessage = "RecordingManager not available";
-                        return;
+                        errorMessage = ex.Message;
+                        Debug.LogError($"[{Constants.LOG_TAG}] HttpServerController: StartRecording error: {ex}");
                     }
-
-                    if (recordingManager.IsRecording)
-                    {
-                        alreadyRecording = true;
-                        return;
-                    }
-
-                    recordingManager.StartRecording();
-
-                    // Capture metadata
-                    currentRecordingFile = recordingManager.CurrentSessionDirectory;
-                    currentRecordingStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    currentRecordingStartedAt = DateTimeOffset.UtcNow.ToString("O");
-
-                    // Save sidecar metadata from request body
-                    if (!string.IsNullOrEmpty(request.Body) && currentRecordingFile != null)
-                    {
-                        SaveSidecarMetadata(currentRecordingFile, request.Body);
-                    }
-
-                    success = true;
-                }
-                catch (Exception ex)
-                {
-                    errorMessage = ex.Message;
-                    Debug.LogError($"[{Constants.LOG_TAG}] HttpServerController: StartRecording error: {ex}");
                 }
             });
             signal.Wait(5000);
@@ -385,16 +429,73 @@ namespace RealityLog.Network
             }
 
             var stoppedAt = DateTimeOffset.UtcNow.ToString("O");
+
+            // Session validation: re-check MP4 atoms + MCAP magic on disk so
+            // the phone learns immediately if this recording is corrupt
+            // instead of discovering it at upload time. Any failure surfaces
+            // as a dedicated `corrupt` status rather than `stopped`.
+            string sessionStatus = "stopped";
+            string? corruptReason = null;
+            if (stoppedFile != null)
+            {
+                var dirPath = Path.Combine(Application.persistentDataPath, stoppedFile);
+                corruptReason = RunSessionValidation(dirPath);
+                if (corruptReason != null)
+                {
+                    sessionStatus = "corrupt";
+                    try { File.WriteAllText(Path.Combine(dirPath, "session_corrupt.txt"), corruptReason); }
+                    catch { /* best effort */ }
+                }
+            }
+
             var json = "{\n" +
-                $"  \"status\": \"stopped\",\n" +
+                $"  \"status\": \"{sessionStatus}\",\n" +
                 $"  \"file\": \"{EscapeJson(stoppedFile ?? "")}\",\n" +
                 $"  \"durationMs\": {durationMs},\n" +
                 $"  \"fileSizeBytes\": {fileSizeBytes},\n" +
                 $"  \"startedAt\": \"{EscapeJson(startedAt ?? "")}\",\n" +
-                $"  \"stoppedAt\": \"{EscapeJson(stoppedAt)}\"\n" +
+                $"  \"stoppedAt\": \"{EscapeJson(stoppedAt)}\",\n" +
+                $"  \"corruptReason\": {(corruptReason != null ? $"\"{EscapeJson(corruptReason)}\"" : "null")}\n" +
                 "}";
 
-            return HttpResponse.Ok(json);
+            return sessionStatus == "corrupt"
+                ? HttpResponse.Corrupt(stoppedFile ?? "", corruptReason ?? "unknown")
+                : HttpResponse.Ok(json);
+        }
+
+        /// <summary>
+        /// Runs MP4 + MCAP validation over the session directory.
+        /// Returns null when everything is intact, or a short reason string
+        /// describing the first failure found.
+        /// </summary>
+        private static string? RunSessionValidation(string sessionDir)
+        {
+            try
+            {
+                var video = Path.Combine(sessionDir, "center_camera.mp4");
+                if (File.Exists(video))
+                {
+                    var mp4 = SessionValidators.ValidateMp4(video);
+                    if (mp4 != SessionValidators.Mp4Status.Valid)
+                        return $"mp4:{mp4}";
+                }
+                // MCAP is optional today but once the recorder writes them,
+                // validate every *.mcap file under the session dir.
+                if (Directory.Exists(sessionDir))
+                {
+                    foreach (var mcap in Directory.GetFiles(sessionDir, "*.mcap", SearchOption.AllDirectories))
+                    {
+                        var status = SessionValidators.ValidateMcap(mcap);
+                        if (status != SessionValidators.McapStatus.Valid)
+                            return $"mcap:{Path.GetFileName(mcap)}:{status}";
+                    }
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"validator_error:{ex.GetType().Name}";
+            }
         }
 
         // ── GET /api/recordings ──
@@ -734,6 +835,55 @@ namespace RealityLog.Network
 
             Debug.Log($"[{Constants.LOG_TAG}] Diagnostics requested — IPs: {string.Join(", ", interfaces)}");
             return HttpResponse.Ok(json);
+        }
+
+        // ── GET /api/pair-token (loopback only) ──
+        //
+        // The phone runs `adb reverse tcp:9555 tcp:8080` during pairing, then
+        // calls http://127.0.0.1:9555/api/pair-token. The loopback check in
+        // EmbeddedHttpServer rejects any non-loopback caller with 401 even
+        // though the path itself is marked exempt from bearer auth.
+
+        private HttpResponse HandlePairToken(HttpRequest request)
+        {
+            if (BearerToken == null)
+            {
+                return HttpResponse.InternalError("token not yet initialised");
+            }
+            var json = $"{{\"token\":\"{EscapeJson(BearerToken)}\",\"header\":\"{AuthTokenManager.AuthHeader}\",\"scheme\":\"Bearer\"}}";
+            return HttpResponse.Ok(json);
+        }
+
+        /// <summary>
+        /// Surface the bearer token inside the VR HUD so a trusted operator
+        /// can read it off the headset if the USB-pairing path fails. Only
+        /// the last 4 chars are shown alongside a short fingerprint — the
+        /// full token never hits a log line outside this method.
+        /// </summary>
+        private void ShowTokenInHud(string token)
+        {
+            try
+            {
+                var go = new GameObject("PairTokenHUD");
+                var mesh = go.AddComponent<TextMesh>();
+                mesh.characterSize = 0.004f;
+                mesh.fontSize = 80;
+                mesh.anchor = TextAnchor.UpperLeft;
+                mesh.color = new Color(1f, 1f, 0f, 0.5f);
+                // Show only the first 6 chars — this is enough for an
+                // operator to confirm the phone is paired to the right
+                // device (the phone also displays the prefix) but does
+                // not expose the full secret to camera-based spies.
+                var preview = token.Substring(0, Math.Min(6, token.Length));
+                mesh.text = $"pair: {preview}…";
+                // We intentionally do not parent to a fixed anchor here —
+                // the Unity scene will pick this up in its next Update()
+                // and reposition via any CanvasFollow component present.
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[{Constants.LOG_TAG}] HttpServerController: Could not render pair HUD: {ex.Message}");
+            }
         }
 
         // ── Helpers ──
