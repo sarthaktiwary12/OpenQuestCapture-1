@@ -93,9 +93,15 @@ namespace RealityLog
                 using var runtime = new AndroidJavaClass("java.lang.Runtime")
                     .CallStatic<AndroidJavaObject>("getRuntime");
 
-                // Send KEYCODE_WAKEUP (224) — same as quest-keep-awake.sh watchdog
+                // Send KEYCODE_WAKEUP (224) — same as quest-keep-awake.sh watchdog.
+                // Use the single-string Runtime.exec(String) overload. Unity's
+                // AndroidJavaObject.Call passes each element of a string[] as a
+                // separate Java argument and then looks up exec(String,String,String),
+                // which does not exist — hence the NoSuchMethodError we saw in
+                // 1.2.1's production logs. exec(String) splits on whitespace via
+                // StringTokenizer; our args have no spaces so it's equivalent.
                 using var p = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/input", "keyevent", "KEYCODE_WAKEUP" });
+                    "/system/bin/input keyevent KEYCODE_WAKEUP");
                 p.Call<int>("waitFor");
 
                 // Re-disable proximity sensor (VrPowerManagerService may re-enable it)
@@ -139,7 +145,7 @@ namespace RealityLog
                 try
                 {
                     using var p = runtime.Call<AndroidJavaObject>("exec",
-                        new string[] { "/system/bin/setprop", "debug.oculus.proximityDisabled", "1" });
+                        "/system/bin/setprop debug.oculus.proximityDisabled 1");
                     p.Call<int>("waitFor");
                 }
                 catch (Exception ex)
@@ -160,7 +166,7 @@ namespace RealityLog
             try
             {
                 using var proc = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/getprop", key });
+                    "/system/bin/getprop " + key);
                 proc.Call<int>("waitFor");
                 using var stream = proc.Call<AndroidJavaObject>("getInputStream");
                 using var reader = new AndroidJavaObject("java.io.BufferedReader",
@@ -184,38 +190,43 @@ namespace RealityLog
                 using var runtime = new AndroidJavaClass("java.lang.Runtime")
                     .CallStatic<AndroidJavaObject>("getRuntime");
 
+                // All exec() calls use the single-string overload so Unity's
+                // AndroidJavaObject doesn't expand the array into separate args
+                // (which resolves to a non-existent Java signature — the root
+                // cause of the 2026-04-18 VR-2 freeze, see commit note).
+
                 // Disable proximity sensor — THE key fix for headset removal freeze
                 using var p1 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/setprop", "debug.oculus.proximityDisabled", "1" });
+                    "/system/bin/setprop debug.oculus.proximityDisabled 1");
                 p1.Call<int>("waitFor");
                 Debug.Log($"[{Constants.LOG_TAG}] KeepAwakeBootstrap: Proximity sensor DISABLED");
 
                 // Max screen timeout
                 using var p2 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/settings", "put", "system", "screen_off_timeout", "2147483647" });
+                    "/system/bin/settings put system screen_off_timeout 2147483647");
                 p2.Call<int>("waitFor");
 
                 // Stay on while plugged in (AC + USB + Wireless = 7)
                 using var p3 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/settings", "put", "global", "stay_on_while_plugged_in", "7" });
+                    "/system/bin/settings put global stay_on_while_plugged_in 7");
                 p3.Call<int>("waitFor");
 
                 // Disable doze / app standby / adaptive battery — prevent OS from throttling us
                 using var p4 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/dumpsys", "deviceidle", "disable" });
+                    "/system/bin/dumpsys deviceidle disable");
                 p4.Call<int>("waitFor");
 
                 using var p5 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/settings", "put", "global", "app_standby_enabled", "0" });
+                    "/system/bin/settings put global app_standby_enabled 0");
                 p5.Call<int>("waitFor");
 
                 using var p6 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/settings", "put", "global", "adaptive_battery_management_enabled", "0" });
+                    "/system/bin/settings put global adaptive_battery_management_enabled 0");
                 p6.Call<int>("waitFor");
 
                 // Prevent WiFi from sleeping (policy 2 = never sleep)
                 using var p7 = runtime.Call<AndroidJavaObject>("exec",
-                    new string[] { "/system/bin/settings", "put", "global", "wifi_sleep_policy", "2" });
+                    "/system/bin/settings put global wifi_sleep_policy 2");
                 p7.Call<int>("waitFor");
 
                 Debug.Log($"[{Constants.LOG_TAG}] KeepAwakeBootstrap: All keep-awake settings applied");
